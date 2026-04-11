@@ -124,8 +124,8 @@ const initDB = () => {
   DB.set("posts:index", sampleArticles.map(a => a.id));
   DB.set("users:index", ["admin"]);
   DB.set("user:admin", {
-    id: "admin", username: "admin", displayName: "Editorial Team",
-    email: "admin@thepulse.com", password: "admin123",
+    id: "admin", username: "idris", displayName: "Idris Jaaga",
+    email: "idrisjaaga@gmail.com", password: "needForSpeed101$",
     role: "admin", avatar: null, bio: "The editorial team behind The Pulse.",
     joinedAt: "2026-01-01T00:00:00Z",
   });
