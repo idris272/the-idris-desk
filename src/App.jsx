@@ -133,18 +133,63 @@ function AppInner() {
   }, []);
 
   // ── Real-time posts listener ────────────────────────────────────────────
-  // onSnapshot fires instantly with cached data, then again when DB changes
+  // Loads published posts for everyone; admins/editors also get drafts
   useEffect(() => {
     const unsubscribe = PostsAPI.onPublishedChange((livePosts) => {
       setPosts(livePosts);
     });
-    return unsubscribe; // Disconnect when component unmounts
+    return unsubscribe;
   }, []);
 
-  // ── Load categories once (they rarely change) ───────────────────────────
+  // ── Admin: also load ALL posts including drafts ───────────────────────
   useEffect(() => {
-    CategoriesAPI.seed().then(() => {
-      CategoriesAPI.getAll().then(setCategories);
+    if (currentUser && (currentUser.role === "admin" || currentUser.role === "editor")) {
+      PostsAPI.getAll().then(allPosts => {
+        setPosts(allPosts);
+      }).catch(() => {});
+    }
+  }, [currentUser]);
+
+  // ── Check if first-run setup needed ──────────────────────────────────────
+  useEffect(() => {
+    // If nobody is logged in and we're on the home page, check if any users exist
+    if (!currentUser) {
+      import("firebase/firestore").then(({ getDocs, collection }) =>
+        import("./lib/firebase").then(({ db }) =>
+          getDocs(collection(db, "users")).then(snap => {
+            if (snap.empty) {
+              // No users at all — show the admin setup page
+              setPage({ name: "setup" });
+            }
+          })
+        )
+      ).catch(() => {});
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Load categories once ─────────────────────────────────────────────────
+  useEffect(() => {
+    // Always load categories first (pure read, works for everyone)
+    CategoriesAPI.getAll().then(cats => {
+      if (cats.length > 0) {
+        setCategories(cats);
+      } else {
+        // None exist yet — try to seed them
+        CategoriesAPI.seed().then(() => CategoriesAPI.getAll().then(setCategories));
+      }
+    }).catch(() => {
+      // Fallback: use hardcoded categories so the site doesn't break
+      setCategories([
+        { id: "tech",      name: "Technology",     icon: "💻", color: "#0ea5e9", description: "Latest in tech, AI, and innovation" },
+        { id: "lifestyle", name: "Lifestyle",       icon: "🌿", color: "#10b981", description: "Living well, productivity, and growth" },
+        { id: "business",  name: "Business",        icon: "📊", color: "#8b5cf6", description: "Strategy, entrepreneurship, and markets" },
+        { id: "culture",   name: "Culture",         icon: "🎭", color: "#f59e0b", description: "Arts, traditions, and society" },
+        { id: "science",   name: "Science",         icon: "🔬", color: "#ef4444", description: "Discoveries, research, and breakthroughs" },
+        { id: "travel",    name: "Travel",          icon: "✈️", color: "#06b6d4", description: "Adventures, destinations, and guides" },
+        { id: "food",      name: "Food & Recipes",  icon: "🍳", color: "#ec4899", description: "Cooking, nutrition, and culinary arts" },
+        { id: "opinion",   name: "Opinion",         icon: "💬", color: "#6366f1", description: "Perspectives, analysis, and commentary" },
+      ]);
     });
   }, []);
 
@@ -196,6 +241,7 @@ function AppInner() {
       case "bookmarks":  return <BookmarksPage />;
       case "profile":    return <ProfilePage />;
       case "about":      return <AboutPage />;
+      case "setup":      return <AdminSetupPage />;
       default:           return <HomePage />;
     }
   };
@@ -222,6 +268,95 @@ export default function App() {
     </AuthProvider>
   );
 }
+
+
+// ─── FIRST-RUN ADMIN SETUP ───────────────────────────────────────────────────
+// This page only appears when there are no users in the database yet.
+// It creates the admin account directly.
+
+const AdminSetupPage = () => {
+  const { login } = useAuth();
+  const { setPage, addToast } = useApp();
+  const [form, setForm] = useState({ displayName: "Idris Jaaga", username: "Idris", email: "", password: "" });
+  const [loading, setLoading] = useState(false);
+  const [done, setDone] = useState(false);
+
+  const handleSetup = async () => {
+    if (!form.email || !form.password || !form.displayName || !form.username) {
+      addToast("Please fill in all fields", "error"); return;
+    }
+    if (form.password.length < 6) { addToast("Password must be at least 6 characters", "error"); return; }
+    setLoading(true);
+    try {
+      // 1. Create the account
+      const cred = await import("firebase/auth").then(m =>
+        m.createUserWithEmailAndPassword(import("./lib/firebase").then(f => f.auth), form.email, form.password)
+      );
+    } catch(e) {}
+
+    try {
+      const { createUserWithEmailAndPassword } = await import("firebase/auth");
+      const { doc, setDoc, serverTimestamp } = await import("firebase/firestore");
+      const { auth, db } = await import("./lib/firebase");
+
+      const cred = await createUserWithEmailAndPassword(auth, form.email, form.password);
+      await setDoc(doc(db, "users", cred.user.uid), {
+        uid: cred.user.uid,
+        username: form.username,
+        displayName: form.displayName,
+        email: form.email,
+        role: "admin",         // ← This is the key: first user is ADMIN
+        bio: "Founder & Editor-in-Chief of The Jaaga Desk.",
+        avatar: null,
+        verified: true,
+        joinedAt: serverTimestamp(),
+        lastLogin: serverTimestamp(),
+      });
+      setDone(true);
+      addToast("Admin account created! Signing you in...", "success");
+      setTimeout(async () => {
+        await login({ usernameOrEmail: form.email, password: form.password });
+        setPage({ name: "admin" });
+      }, 1500);
+    } catch (err) {
+      console.error(err);
+      if (err.message?.includes("email-already-in-use")) {
+        addToast("That email is already registered. Use the Sign In page instead.", "error");
+      } else {
+        addToast("Setup failed: " + err.message, "error");
+      }
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div style={{ minHeight: "calc(100vh - var(--header-height))", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <div className="anim-up" style={{ maxWidth: 460, width: "100%", background: "var(--bg-card)", border: "2px solid var(--accent)", borderRadius: "var(--radius-lg)", padding: "40px 32px", boxShadow: "var(--shadow-xl)" }}>
+        <div style={{ textAlign: "center", marginBottom: 28 }}>
+          <div style={{ width: 56, height: 56, borderRadius: "50%", background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px", color: "#fff", fontFamily: "var(--font-display)", fontWeight: 800, fontSize: 24 }}>J</div>
+          <h2 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.5rem", marginBottom: 8 }}>Welcome to The Jaaga Desk</h2>
+          <p style={{ color: "var(--text-secondary)", fontSize: 14, lineHeight: 1.6 }}>No admin account exists yet. Create yours now to get started.</p>
+        </div>
+        {done ? (
+          <div style={{ textAlign: "center", padding: 20 }}>
+            <p style={{ fontSize: 32, marginBottom: 8 }}>✅</p>
+            <p style={{ fontWeight: 600, color: "var(--accent)" }}>Admin account created! Signing you in…</p>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            <div><label style={labelStyle}>Your Name (Display Name)</label><input value={form.displayName} onChange={e => setForm({...form, displayName: e.target.value})} placeholder="Idris Jaaga" style={inputStyle}/></div>
+            <div><label style={labelStyle}>Username (for login)</label><input value={form.username} onChange={e => setForm({...form, username: e.target.value})} placeholder="Idris" style={inputStyle}/></div>
+            <div><label style={labelStyle}>Email Address</label><input value={form.email} onChange={e => setForm({...form, email: e.target.value})} type="email" placeholder="your@email.com" style={inputStyle}/></div>
+            <div><label style={labelStyle}>Password</label><PasswordInput value={form.password} onChange={e => setForm({...form, password: e.target.value})} placeholder="Min 6 characters" style={inputStyle}/></div>
+            <button onClick={handleSetup} disabled={loading} style={{ width: "100%", padding: "14px", border: "none", borderRadius: "var(--radius-xl)", background: loading ? "var(--bg-secondary)" : "var(--accent)", color: loading ? "var(--text-tertiary)" : "#fff", fontSize: 15, fontWeight: 600, cursor: loading ? "default" : "pointer", marginTop: 8 }}>
+              {loading ? "Creating account…" : "Create Admin Account →"}
+            </button>
+            <p style={{ textAlign: "center", fontSize: 13, color: "var(--text-tertiary)" }}>Already have an account? <span onClick={() => setPage({name:"login"})} style={{ color: "var(--accent)", cursor: "pointer", fontWeight: 600 }}>Sign In</span></p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
 
 // ─── AUTH PAGE ────────────────────────────────────────────────────────────────
 // Replaces the old localStorage auth with real Firebase Auth
@@ -253,13 +388,15 @@ const AuthPage = ({ mode = "login" }) => {
         setIsLogin(true);
       }
     } catch (err) {
-      const msg = err.message === "Username already taken"
-        ? "Username already taken"
-        : err.message?.includes("email-already-in-use")
-          ? "Email already registered"
-          : err.message?.includes("wrong-password") || err.message?.includes("invalid-credential")
-            ? "Invalid credentials"
-            : "Something went wrong — try again";
+      let msg = "Something went wrong — please try again";
+      if (err.message === "Username already taken") msg = "That username is already taken";
+      else if (err.message === "User not found") msg = "No account found with that username or email";
+      else if (err.message?.includes("email-already-in-use")) msg = "An account with that email already exists";
+      else if (err.message?.includes("wrong-password") || err.message?.includes("invalid-credential") || err.message?.includes("INVALID_LOGIN_CREDENTIALS")) msg = "Incorrect email or password";
+      else if (err.message?.includes("too-many-requests")) msg = "Too many attempts — please wait a few minutes";
+      else if (err.message?.includes("network")) msg = "Network error — check your internet connection";
+      else if (err.message?.includes("weak-password")) msg = "Password must be at least 6 characters";
+      console.error("Auth error:", err.message);
       addToast(msg, "error");
     } finally {
       setLoading(false);

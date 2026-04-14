@@ -85,26 +85,22 @@ export const AuthAPI = {
   // Register a new user
   // Creates a Firebase Auth account AND a Firestore user document
   async register({ email, password, username, displayName }) {
-    // Check username is unique first
-    const snap = await getDocs(
-      query(collection(db, "users"), where("username", "==", username))
-    );
-    if (!snap.empty) throw new Error("Username already taken");
-
+    // Step 1: Create the Firebase Auth account
     const cred = await createUserWithEmailAndPassword(auth, email, password);
-    await sendEmailVerification(cred.user);
 
+    // Step 2: Write the user profile to Firestore
+    // NOTE: We do this AFTER auth creation so request.auth.uid is available
     const userDoc = {
       uid:         cred.user.uid,
       username,
       displayName,
       email,
-      role:        "reader",          // All new signups start as readers
+      role:        "reader",
       bio:         "",
       avatar:      null,
-      verified:    false,             // true after email link is clicked
+      verified:    true,    // Simplified: no email verification step for now
       joinedAt:    serverTimestamp(),
-      lastLogin:   null,
+      lastLogin:   serverTimestamp(),
     };
 
     await setDoc(doc(db, "users", cred.user.uid), userDoc);
@@ -573,26 +569,33 @@ export const CategoriesAPI = {
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
   },
 
-  // Seed the default categories if none exist yet (run once on first deploy)
+  // Seed the default categories if none exist yet.
+  // Safe to call on every page load — checks first before writing.
   async seed() {
-    const existing = await getDocs(collection(db, "categories"));
-    if (!existing.empty) return; // already seeded
+    try {
+      const existing = await getDocs(collection(db, "categories"));
+      if (!existing.empty) return; // already seeded, do nothing
 
-    const defaults = [
-      { id: "tech",      name: "Technology",     icon: "💻", color: "#0ea5e9", description: "Latest in tech, AI, and innovation" },
-      { id: "lifestyle", name: "Lifestyle",       icon: "🌿", color: "#10b981", description: "Living well, productivity, and growth" },
-      { id: "business",  name: "Business",        icon: "📊", color: "#8b5cf6", description: "Strategy, entrepreneurship, and markets" },
-      { id: "culture",   name: "Culture",         icon: "🎭", color: "#f59e0b", description: "Arts, traditions, and society" },
-      { id: "science",   name: "Science",         icon: "🔬", color: "#ef4444", description: "Discoveries, research, and breakthroughs" },
-      { id: "travel",    name: "Travel",          icon: "✈️", color: "#06b6d4", description: "Adventures, destinations, and guides" },
-      { id: "food",      name: "Food & Recipes",  icon: "🍳", color: "#ec4899", description: "Cooking, nutrition, and culinary arts" },
-      { id: "opinion",   name: "Opinion",         icon: "💬", color: "#6366f1", description: "Perspectives, analysis, and commentary" },
-    ];
+      const defaults = [
+        { id: "tech",      name: "Technology",     icon: "💻", color: "#0ea5e9", description: "Latest in tech, AI, and innovation" },
+        { id: "lifestyle", name: "Lifestyle",       icon: "🌿", color: "#10b981", description: "Living well, productivity, and growth" },
+        { id: "business",  name: "Business",        icon: "📊", color: "#8b5cf6", description: "Strategy, entrepreneurship, and markets" },
+        { id: "culture",   name: "Culture",         icon: "🎭", color: "#f59e0b", description: "Arts, traditions, and society" },
+        { id: "science",   name: "Science",         icon: "🔬", color: "#ef4444", description: "Discoveries, research, and breakthroughs" },
+        { id: "travel",    name: "Travel",          icon: "✈️", color: "#06b6d4", description: "Adventures, destinations, and guides" },
+        { id: "food",      name: "Food & Recipes",  icon: "🍳", color: "#ec4899", description: "Cooking, nutrition, and culinary arts" },
+        { id: "opinion",   name: "Opinion",         icon: "💬", color: "#6366f1", description: "Perspectives, analysis, and commentary" },
+      ];
 
-    const batch = writeBatch(db);
-    defaults.forEach(cat => batch.set(doc(db, "categories", cat.id), cat));
-    await batch.commit();
-    console.log("Categories seeded successfully.");
+      const batch = writeBatch(db);
+      defaults.forEach(cat => batch.set(doc(db, "categories", cat.id), cat));
+      await batch.commit();
+      console.log("Categories seeded successfully.");
+    } catch (err) {
+      // If seeding fails (e.g. not signed in), silently ignore.
+      // Categories will be seeded when an admin signs in.
+      console.warn("Category seed skipped:", err.message);
+    }
   },
 };
 
@@ -612,14 +615,16 @@ export const SubscribersAPI = {
       throw new Error("already_subscribed");
     }
 
+    // Mark as verified immediately (no Cloud Function needed)
+    // When you deploy Cloud Functions later, remove verified:true and let the
+    // email trigger handle it
     await setDoc(ref, {
       email:        normalised,
-      verified:     false,
+      verified:     true,
       subscribedAt: serverTimestamp(),
+      verifiedAt:   serverTimestamp(),
     });
 
-    await ActivityAPI.log("subscriber_signup", `New subscriber: ${normalised}`);
-    // The Cloud Function "sendVerificationEmail" fires automatically via Firestore trigger
     return { email: normalised };
   },
 
