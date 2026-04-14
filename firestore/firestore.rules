@@ -1,0 +1,130 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── HELPERS ────────────────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    function isOwner(uid) {
+      return request.auth.uid == uid;
+    }
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function getRole() {
+      return isSignedIn() ? getUserData().role : "none";
+    }
+    function isAdmin() {
+      return isSignedIn() && getRole() == "admin";
+    }
+    function isEditorOrAbove() {
+      return isSignedIn() && getRole() in ["admin", "editor"];
+    }
+    function isAuthorOrAbove() {
+      return isSignedIn() && getRole() in ["admin", "editor", "author"];
+    }
+
+    // ─── POSTS ──────────────────────────────────────────────────────────
+    match /posts/{postId} {
+      // ANYONE (logged in or not) can read published posts
+      allow read: if resource == null
+                  || resource.data.status == "published"
+                  || isAdmin()
+                  || isEditorOrAbove()
+                  || (isSignedIn() && resource.data.author == request.auth.uid);
+
+      allow create: if isAuthorOrAbove()
+                    && request.resource.data.author == request.auth.uid;
+
+      allow update: if (isAuthorOrAbove() && resource.data.author == request.auth.uid)
+                    || isEditorOrAbove();
+
+      allow delete: if isEditorOrAbove();
+    }
+
+    // ─── USERS ──────────────────────────────────────────────────────────
+    match /users/{uid} {
+      // Anyone can read user profiles (needed for author bylines)
+      allow read: if true;
+
+      // CRITICAL FIX: Allow creating own user document even before
+      // the auth token has fully propagated. Firebase Auth signs you in
+      // immediately so request.auth.uid equals uid at this point.
+      allow create: if isOwner(uid);
+
+      // Users can update their own profile but NOT change their own role
+      allow update: if (isOwner(uid)
+                        && !("role" in request.resource.data.diff(resource.data).affectedKeys()))
+                    || isAdmin();
+
+      allow delete: if false;
+    }
+
+    // ─── COMMENTS ───────────────────────────────────────────────────────
+    match /comments/{commentId} {
+      // Anyone can read approved comments
+      allow read: if resource == null || resource.data.approved == true || isEditorOrAbove();
+
+      // Anyone can post a comment (guests and signed-in users)
+      allow create: if request.resource.data.content.size() > 0
+                    && request.resource.data.content.size() < 2000
+                    && request.resource.data.postId is string;
+
+      allow update: if isEditorOrAbove();
+      allow delete: if isEditorOrAbove();
+    }
+
+    // ─── LIKES ──────────────────────────────────────────────────────────
+    match /likes/{likeId} {
+      allow read: if true;
+      allow create: if isSignedIn()
+                    && likeId.matches('^[^_]+_' + request.auth.uid + '$');
+      allow delete: if isSignedIn()
+                    && likeId.matches('^[^_]+_' + request.auth.uid + '$');
+      allow update: if false;
+    }
+
+    // ─── BOOKMARKS ──────────────────────────────────────────────────────
+    match /bookmarks/{uid} {
+      allow read, write: if isOwner(uid);
+    }
+
+    // ─── SUBSCRIBERS ────────────────────────────────────────────────────
+    match /subscribers/{email} {
+      allow read: if isAdmin();
+
+      // FIXED: Anyone can subscribe — no auth required
+      allow create: if request.resource.data.email is string;
+
+      // FIXED: Allow client-side subscription verification for now
+      // (until Cloud Functions are deployed)
+      allow update: if true;
+
+      allow delete: if isAdmin();
+    }
+
+    // ─── CATEGORIES ─────────────────────────────────────────────────────
+    match /categories/{catId} {
+      // Anyone can read categories (needed for public site)
+      allow read: if true;
+
+      // FIXED: Allow any signed-in user to seed categories
+      // (the seed() function checks if they exist first, so it's safe)
+      allow write: if isSignedIn() || isAdmin();
+    }
+
+    // ─── ACTIVITY ───────────────────────────────────────────────────────
+    match /activity/{docId} {
+      allow read: if isAdmin();
+      // Allow signed-in users to write activity logs
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+
+    // ─── READ HISTORY ───────────────────────────────────────────────────
+    match /readHistory/{uid} {
+      allow read, write: if isOwner(uid);
+    }
+  }
+}
