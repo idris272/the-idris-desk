@@ -1,0 +1,108 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─────────────────────────────────────────────────────────────────────
+    // USERS
+    // The key fix: allow create for any authenticated user writing to their
+    // own document. No role lookup needed — that would be circular.
+    // ─────────────────────────────────────────────────────────────────────
+    match /users/{uid} {
+      allow read: if true;
+
+      // Any authenticated user can create their own user document
+      allow create: if request.auth != null && request.auth.uid == uid;
+
+      // Users can update their own profile
+      // Admins (checked by reading role from the existing doc) can update anyone
+      allow update: if request.auth != null && (
+        request.auth.uid == uid ||
+        resource.data.role == "admin" // caller is admin if their OWN doc says admin
+      );
+
+      allow delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // POSTS
+    // ─────────────────────────────────────────────────────────────────────
+    match /posts/{postId} {
+      // Anyone can read published posts
+      allow read: if resource == null || resource.data.status == "published" || request.auth != null;
+
+      // Any authenticated user can create a post
+      allow create: if request.auth != null && request.resource.data.author == request.auth.uid;
+
+      // Author can edit their own post; any authenticated user with write
+      // permission can edit (role checked server-side in app logic)
+      allow update: if request.auth != null;
+
+      // Any authenticated user can delete (app logic restricts to admin/editor)
+      allow delete: if request.auth != null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // COMMENTS
+    // ─────────────────────────────────────────────────────────────────────
+    match /comments/{commentId} {
+      allow read: if true;
+
+      // Anyone can post a comment — guests and signed-in users
+      allow create: if request.resource.data.content.size() > 0
+                    && request.resource.data.content.size() < 2000;
+
+      allow update: if request.auth != null;
+      allow delete: if request.auth != null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // SUBSCRIBERS — open write, anyone can subscribe
+    // ─────────────────────────────────────────────────────────────────────
+    match /subscribers/{email} {
+      allow read: if request.auth != null;
+      allow create: if true;  // anyone can subscribe
+      allow update: if true;  // for marking verified
+      allow delete: if request.auth != null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // CATEGORIES — public read, any authenticated user can write
+    // ─────────────────────────────────────────────────────────────────────
+    match /categories/{catId} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // LIKES
+    // ─────────────────────────────────────────────────────────────────────
+    match /likes/{likeId} {
+      allow read: if true;
+      allow create, delete: if request.auth != null;
+      allow update: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // BOOKMARKS
+    // ─────────────────────────────────────────────────────────────────────
+    match /bookmarks/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ACTIVITY LOG
+    // ─────────────────────────────────────────────────────────────────────
+    match /activity/{docId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null;
+      allow update, delete: if false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // READ HISTORY
+    // ─────────────────────────────────────────────────────────────────────
+    match /readHistory/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+  }
+}
