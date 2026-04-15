@@ -383,11 +383,10 @@ const AuthPage = ({ mode = "login" }) => {
         if (form.password.length < 6) {
           addToast("Password must be at least 6 characters", "error"); return;
         }
-        // Register then immediately log in — no email verification step
-        await register({ email: form.email, password: form.password, username: form.username, displayName: form.displayName });
-        // Small delay to let Firestore write settle, then sign in
-        await new Promise(r => setTimeout(r, 800));
-        const user = await login({ usernameOrEmail: form.email, password: form.password });
+        // Register creates both Auth account and Firestore doc.
+        // After register(), Firebase Auth automatically signs the user in,
+        // so onAuthStateChanged fires and sets currentUser via AuthContext.
+        const user = await register({ email: form.email, password: form.password, username: form.username, displayName: form.displayName });
         addToast(`Welcome to The Jaaga Desk, ${user.displayName}!`, "success");
         setPage({ name: user.role === "admin" ? "admin" : "home" });
       }

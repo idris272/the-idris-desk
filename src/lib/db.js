@@ -85,9 +85,24 @@ export const AuthAPI = {
   // Register a new user
   // Creates a Firebase Auth account AND a Firestore user document
   async register({ email, password, username, displayName }) {
+    // Check if username is already taken BEFORE creating the Auth account
+    if (username) {
+      const usernameCheck = await getDocs(
+        query(collection(db, "users"), where("username", "==", username))
+      );
+      if (!usernameCheck.empty) {
+        throw new Error("Username already taken");
+      }
+    }
+
     // Step 1: Create Firebase Auth account
     const cred = await createUserWithEmailAndPassword(auth, email, password);
     const uid = cred.user.uid;
+
+    // Step 2: Wait briefly for the auth token to propagate to Firestore
+    // This is critical — Firestore rules check request.auth.uid which needs
+    // a moment to become available after createUserWithEmailAndPassword
+    await new Promise(r => setTimeout(r, 500));
 
     const userDoc = {
       uid,
@@ -102,20 +117,21 @@ export const AuthAPI = {
       lastLogin:   serverTimestamp(),
     };
 
-    // Step 2: Write to Firestore — retry once if it fails
-    // (rules require auth token which may take a moment to propagate)
-    try {
-      await setDoc(doc(db, "users", uid), userDoc);
-    } catch (firstErr) {
-      // Wait 1 second for auth token to propagate, then retry
-      await new Promise(r => setTimeout(r, 1000));
+    // Step 3: Write to Firestore with multiple retries
+    let written = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await setDoc(doc(db, "users", uid), userDoc);
-      } catch (secondErr) {
-        // Log but don't throw — Auth account is created, user can still log in
-        // The missing Firestore doc will be created on next login
-        console.warn("Firestore user doc write failed (will retry on login):", secondErr.message);
+        written = true;
+        break;
+      } catch (err) {
+        console.warn(`Firestore write attempt ${attempt + 1} failed:`, err.message);
+        if (attempt < 2) await new Promise(r => setTimeout(r, 1500));
       }
+    }
+
+    if (!written) {
+      console.warn("Firestore user doc write failed — will be created on login");
     }
 
     return { uid, ...userDoc };
@@ -666,15 +682,21 @@ export const SubscribersAPI = {
   async subscribe(email) {
     const normalised = email.toLowerCase().trim();
     const ref = doc(db, "subscribers", normalised);
-    const existing = await getDoc(ref);
 
-    if (existing.exists() && existing.data().verified) {
-      throw new Error("already_subscribed");
+    // Try to check if already subscribed, but don't fail if rules block the read
+    try {
+      const existing = await getDoc(ref);
+      if (existing.exists() && existing.data().verified) {
+        throw new Error("already_subscribed");
+      }
+    } catch (err) {
+      // If this is "already_subscribed" rethrow it; otherwise ignore the read failure
+      // (unauthenticated users may not have read access to subscribers collection)
+      if (err.message === "already_subscribed") throw err;
+      // Continue with the write — Firestore rules allow create for anyone
     }
 
-    // Mark as verified immediately (no Cloud Function needed)
-    // When you deploy Cloud Functions later, remove verified:true and let the
-    // email trigger handle it
+    // Write the subscriber document
     await setDoc(ref, {
       email:        normalised,
       verified:     true,
@@ -714,12 +736,18 @@ export const SubscribersAPI = {
 
 export const ActivityAPI = {
   // Log an action (called internally by other API functions)
+  // Wrapped in try/catch so it never breaks the calling operation
   async log(action, details) {
-    await addDoc(collection(db, "activity"), {
-      action,
-      details,
-      timestamp: serverTimestamp(),
-    });
+    try {
+      await addDoc(collection(db, "activity"), {
+        action,
+        details,
+        timestamp: serverTimestamp(),
+      });
+    } catch (err) {
+      // Silently ignore — activity logging should never break main operations
+      console.warn("Activity log failed (likely unauthenticated):", err.message);
+    }
   },
 
   // Get recent activity (admin dashboard)
