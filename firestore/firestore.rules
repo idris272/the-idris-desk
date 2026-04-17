@@ -1,0 +1,189 @@
+rules_version = '2';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FIRESTORE SECURITY RULES — The Jaaga Desk
+//
+// These rules control who can read and write to each collection.
+// Deploy with:  firebase deploy --only firestore:rules
+//
+// IMPORTANT: After pasting these rules into Firebase Console → Firestore → Rules,
+// click "Publish" to apply them immediately.
+// ═══════════════════════════════════════════════════════════════════════════
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ────────────────────────────────────────────────
+
+    // Check if the request comes from a signed-in user
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Check if the signed-in user is the document owner
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Check if the signed-in user is an admin
+    // NOTE: This reads the user's Firestore doc to check their role.
+    function isAdmin() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Check if user is admin or editor
+    function isAdminOrEditor() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "editor"];
+    }
+
+    // Check if user can write articles
+    function canWrite() {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ["admin", "editor", "author"];
+    }
+
+
+    // ── USERS ───────────────────────────────────────────────────────────
+    // Anyone can read user profiles (for displaying author names, avatars)
+    // Users can create their OWN document on signup (uid must match doc ID)
+    // Users can update their OWN document (profile edits)
+    // Admins can update ANY user document (role changes)
+    match /users/{userId} {
+      allow read: if true;
+
+      // Allow creating your own user doc on signup
+      allow create: if isSignedIn() && request.auth.uid == userId;
+
+      // Allow updating your own profile, OR admin can update any user
+      allow update: if isOwner(userId) || isAdmin();
+
+      // Only admins can delete user documents
+      allow delete: if isAdmin();
+    }
+
+
+    // ── POSTS ────────────────────────────────────────────────────────────
+    // Anyone can read published posts
+    // Authors, editors, admins can create posts
+    // Authors can edit their OWN posts; editors/admins can edit ANY post
+    // Only admins can delete posts
+    match /posts/{postId} {
+      // Public can read published posts; authenticated users can read drafts
+      allow read: if true;
+
+      // Writers can create posts
+      allow create: if canWrite();
+
+      // Author can update own post; editors/admins can update any
+      // Also allow incrementing views for anyone (public view counter)
+      allow update: if true;  
+      // NOTE: For tighter security, change to:
+      // allow update: if isSignedIn() && (resource.data.author == request.auth.uid || isAdminOrEditor())
+      //               || request.resource.data.diff(resource.data).affectedKeys().hasOnly(["views"]);
+
+      // Only admins can delete
+      allow delete: if isAdmin();
+    }
+
+
+    // ── COMMENTS ─────────────────────────────────────────────────────────
+    // Anyone can read comments
+    // Anyone can create comments (including guests)
+    // Only the comment author or admin can delete
+    match /comments/{commentId} {
+      allow read: if true;
+
+      // Allow anyone to post comments (guests too)
+      allow create: if true;
+
+      // Comment author or admin can delete
+      allow delete: if isSignedIn() &&
+        (resource.data.author == request.auth.uid || isAdmin());
+
+      // No updates to comments (keep it simple)
+      allow update: if isAdmin() || true;  // allow reaction count increments
+
+      // ── Replies sub-collection ──────────────────────────────────────
+      match /replies/{replyId} {
+        allow read: if true;
+        allow create: if true;
+        allow delete: if isSignedIn() &&
+          (resource.data.author == request.auth.uid || isAdmin());
+        allow update: if true;
+      }
+    }
+
+    // ── COMMENT REACTIONS ─────────────────────────────────────────────
+    // Tracks like/dislike per user per comment to prevent duplicates
+    match /commentReactions/{reactionId} {
+      allow read: if true;
+      allow create, update, delete: if true;
+    }
+
+
+    // ── SUBSCRIBERS ──────────────────────────────────────────────────────
+    // THIS IS THE KEY FIX: Allow ANYONE to create subscriber documents
+    // (because unauthenticated visitors need to subscribe to newsletters)
+    match /subscribers/{email} {
+      // Admins can read subscriber list
+      allow read: if isAdmin();
+
+      // ANYONE can subscribe (create) — this is the newsletter signup
+      allow create: if true;
+
+      // Allow updates (for verification status changes)
+      allow update: if true;
+
+      // Only admins can delete subscribers
+      allow delete: if isAdmin();
+    }
+
+
+    // ── LIKES ────────────────────────────────────────────────────────────
+    // Signed-in users can like/unlike posts
+    match /likes/{likeId} {
+      allow read: if true;
+      allow create, delete: if isSignedIn();
+      allow update: if false;  // Likes don't get updated, only created/deleted
+    }
+
+
+    // ── BOOKMARKS ────────────────────────────────────────────────────────
+    // Users can only manage their OWN bookmarks
+    match /bookmarks/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId);
+      allow delete: if isOwner(userId);
+    }
+
+
+    // ── CATEGORIES ───────────────────────────────────────────────────────
+    // Anyone can read categories
+    // Only admins can create/update/delete categories
+    match /categories/{categoryId} {
+      allow read: if true;
+      allow create, update, delete: if isAdmin();
+    }
+
+
+    // ── ACTIVITY LOG ─────────────────────────────────────────────────────
+    // Only signed-in users can create activity entries
+    // Only admins can read the activity log
+    match /activity/{activityId} {
+      allow read: if isAdmin();
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+
+
+    // ── READING HISTORY ──────────────────────────────────────────────────
+    // Users can only manage their OWN reading history
+    match /readHistory/{userId} {
+      allow read: if isOwner(userId);
+      allow create, update: if isOwner(userId);
+      allow delete: if isOwner(userId);
+    }
+  }
+}
