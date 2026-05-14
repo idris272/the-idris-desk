@@ -44,7 +44,7 @@ import {
 } from "firebase/auth";
 
 import { db, auth } from "./firebase";
-import { uploadImage } from "./cloudinary";
+import { uploadImage, uploadMedia } from "./cloudinary";
 
 // ─── UTILITY ────────────────────────────────────────────────────────────────
 
@@ -752,20 +752,35 @@ export const CategoriesAPI = {
     return snap.docs.map(d => ({ id: d.id, ...d.data() }));
   },
 
+  async update(id, updates) {
+    const allowed = ["name", "icon", "color", "description", "coverImage", "coverType"];
+    const safe = Object.fromEntries(
+      Object.entries(updates).filter(([k]) => allowed.includes(k))
+    );
+    await updateDoc(doc(db, "categories", id), safe);
+    return safe;
+  },
+
+  async uploadCoverMedia(id, source) {
+    const { url, type } = await uploadMedia(source, `jaaga/categories/${id}`);
+    await updateDoc(doc(db, "categories", id), { coverImage: url, coverType: type });
+    return { url, type };
+  },
+
   async seed() {
     try {
       const existing = await getDocs(collection(db, "categories"));
       if (!existing.empty) return;
 
       const defaults = [
-        { id: "tech",      name: "Technology",     icon: "💻", color: "#0ea5e9", description: "Latest in tech, AI, and innovation" },
-        { id: "lifestyle", name: "Lifestyle",       icon: "🌿", color: "#10b981", description: "Living well, productivity, and growth" },
-        { id: "business",  name: "Business",        icon: "📊", color: "#8b5cf6", description: "Strategy, entrepreneurship, and markets" },
-        { id: "culture",   name: "Culture",         icon: "🎭", color: "#f59e0b", description: "Arts, traditions, and society" },
-        { id: "science",   name: "Science",         icon: "🔬", color: "#ef4444", description: "Discoveries, research, and breakthroughs" },
-        { id: "travel",    name: "Travel",          icon: "✈️", color: "#06b6d4", description: "Adventures, destinations, and guides" },
-        { id: "food",      name: "Food & Recipes",  icon: "🍳", color: "#ec4899", description: "Cooking, nutrition, and culinary arts" },
-        { id: "opinion",   name: "Opinion",         icon: "💬", color: "#6366f1", description: "Perspectives, analysis, and commentary" },
+        { id: "tech",      name: "Technology",     icon: "💻", color: "#0ea5e9", description: "Latest in tech, AI, and innovation",   coverImage: "", coverType: "image" },
+        { id: "lifestyle", name: "Lifestyle",       icon: "🌿", color: "#10b981", description: "Living well, productivity, and growth", coverImage: "", coverType: "image" },
+        { id: "business",  name: "Business",        icon: "📊", color: "#8b5cf6", description: "Strategy, entrepreneurship, and markets", coverImage: "", coverType: "image" },
+        { id: "culture",   name: "Culture",         icon: "🎭", color: "#f59e0b", description: "Arts, traditions, and society",         coverImage: "", coverType: "image" },
+        { id: "science",   name: "Science",         icon: "🔬", color: "#ef4444", description: "Discoveries, research, and breakthroughs", coverImage: "", coverType: "image" },
+        { id: "travel",    name: "Travel",          icon: "✈️", color: "#06b6d4", description: "Adventures, destinations, and guides",  coverImage: "", coverType: "image" },
+        { id: "food",      name: "Food & Recipes",  icon: "🍳", color: "#ec4899", description: "Cooking, nutrition, and culinary arts", coverImage: "", coverType: "image" },
+        { id: "opinion",   name: "Opinion",         icon: "💬", color: "#6366f1", description: "Perspectives, analysis, and commentary", coverImage: "", coverType: "image" },
       ];
 
       const batch = writeBatch(db);
@@ -775,6 +790,153 @@ export const CategoriesAPI = {
     } catch (err) {
       console.warn("Category seed skipped:", err.message);
     }
+  },
+};
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SITE SETTINGS — Admin-managed site identity, hero slides, section media
+//
+// Single document at:  settings/site
+//   .siteName, .tagline, .logoUrl
+//   .heroSlides[]:  { id, type: "image"|"video", url, heading, subheading, ctaText, ctaHref, durationMs }
+//   .sections{}:    map of { backgroundUrl, backgroundType }
+//                   keys: featured, latest, trending, topics, newsletter, about, footer, categories
+//   .about:         { hero: { url, type }, title, body }
+//   .footer:        { copyright, blurb }
+//   .social:        { twitter, instagram, facebook, youtube, linkedin, tiktok }
+//   .updatedAt
+// ═══════════════════════════════════════════════════════════════════════════
+
+export const DEFAULT_SITE_SETTINGS = {
+  siteName: "The Jaaga Desk",
+  tagline:  "Stories that illuminate",
+  logoUrl:  "",
+  heroSlides: [
+    {
+      id: "default-1",
+      type: "image",
+      url: "https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=2400&h=1400&fit=crop",
+      heading: "Stories that illuminate",
+      subheading: "A digital publication rooted in Northern Ghanaian heritage.",
+      ctaText: "Explore Stories",
+      ctaHref: "#/trending",
+      durationMs: 7000,
+    },
+    {
+      id: "default-2",
+      type: "image",
+      url: "https://images.unsplash.com/photo-1499750310107-5fef28a66643?w=2400&h=1400&fit=crop",
+      heading: "Read deeper.",
+      subheading: "Long reads on technology, culture, and ideas that matter.",
+      ctaText: "Browse Topics",
+      ctaHref: "#/categories",
+      durationMs: 7000,
+    },
+  ],
+  sections: {
+    featured:   { backgroundUrl: "", backgroundType: "image" },
+    latest:     { backgroundUrl: "", backgroundType: "image" },
+    trending:   { backgroundUrl: "", backgroundType: "image" },
+    topics:     { backgroundUrl: "", backgroundType: "image" },
+    newsletter: { backgroundUrl: "", backgroundType: "image" },
+    about:      { backgroundUrl: "", backgroundType: "image" },
+    footer:     { backgroundUrl: "", backgroundType: "image" },
+    categories: { backgroundUrl: "", backgroundType: "image" },
+  },
+  about: {
+    hero: { url: "", type: "image" },
+    title: "About The Jaaga Desk",
+    body:
+      "The Jaaga Desk is a digital publication rooted in Northern Ghanaian heritage, dedicated to delivering thoughtful stories that inform, inspire, and illuminate.\n\n" +
+      "\"Jaaga\" carries the meaning of \"a place\" and \"to be awake\" — this space is both a gathering point and a call to consciousness.\n\n" +
+      "From technology to culture, science to food, travel to opinion — we explore the ideas that shape our world, always with depth and a distinctive perspective.",
+    contactEmail: "hello@idrisjaaga.com",
+  },
+  footer: {
+    copyright: "© 2026 The Jaaga Desk. All rights reserved.",
+    blurb: "Stories that illuminate — rooted in Northern Ghanaian heritage, reaching across the world.",
+  },
+  social: { twitter: "", instagram: "", facebook: "", youtube: "", linkedin: "", tiktok: "" },
+};
+
+export const SiteSettingsAPI = {
+  async get() {
+    const snap = await getDoc(doc(db, "settings", "site"));
+    if (!snap.exists()) return { ...DEFAULT_SITE_SETTINGS };
+    const data = snap.data() || {};
+    // Merge with defaults so newly-added fields always have a value
+    return stampToISO({
+      ...DEFAULT_SITE_SETTINGS,
+      ...data,
+      sections: { ...DEFAULT_SITE_SETTINGS.sections, ...(data.sections || {}) },
+      about:    { ...DEFAULT_SITE_SETTINGS.about,    ...(data.about    || {}),
+                  hero: { ...DEFAULT_SITE_SETTINGS.about.hero, ...((data.about || {}).hero || {}) } },
+      footer:   { ...DEFAULT_SITE_SETTINGS.footer,   ...(data.footer   || {}) },
+      social:   { ...DEFAULT_SITE_SETTINGS.social,   ...(data.social   || {}) },
+      heroSlides: Array.isArray(data.heroSlides) && data.heroSlides.length > 0
+        ? data.heroSlides
+        : DEFAULT_SITE_SETTINGS.heroSlides,
+    });
+  },
+
+  // Subscribe so every visitor sees changes live
+  onChange(callback) {
+    return onSnapshot(doc(db, "settings", "site"), (snap) => {
+      if (!snap.exists()) {
+        callback({ ...DEFAULT_SITE_SETTINGS });
+        return;
+      }
+      const data = snap.data() || {};
+      callback(stampToISO({
+        ...DEFAULT_SITE_SETTINGS,
+        ...data,
+        sections: { ...DEFAULT_SITE_SETTINGS.sections, ...(data.sections || {}) },
+        about:    { ...DEFAULT_SITE_SETTINGS.about,    ...(data.about    || {}),
+                    hero: { ...DEFAULT_SITE_SETTINGS.about.hero, ...((data.about || {}).hero || {}) } },
+        footer:   { ...DEFAULT_SITE_SETTINGS.footer,   ...(data.footer   || {}) },
+        social:   { ...DEFAULT_SITE_SETTINGS.social,   ...(data.social   || {}) },
+        heroSlides: Array.isArray(data.heroSlides) && data.heroSlides.length > 0
+          ? data.heroSlides
+          : DEFAULT_SITE_SETTINGS.heroSlides,
+      }));
+    }, (err) => {
+      console.warn("siteSettings onSnapshot failed:", err.message);
+    });
+  },
+
+  // Merge-update — caller passes only the keys they want to change.
+  async save(updates) {
+    const clean = { ...updates, updatedAt: serverTimestamp() };
+    await setDoc(doc(db, "settings", "site"), clean, { merge: true });
+    return clean;
+  },
+
+  // Upload media (image or video) and return { url, type } — does NOT persist to settings.
+  // Caller decides where the URL lands (a hero slide, a section bg, the logo, etc).
+  async uploadMedia(source, folder = "jaaga/site") {
+    return uploadMedia(source, folder);
+  },
+
+  // One-shot helpers for common slots — upload then save.
+  async setLogo(source) {
+    const { url } = await uploadMedia(source, "jaaga/site/logo");
+    await this.save({ logoUrl: url });
+    return url;
+  },
+
+  async setSectionMedia(sectionKey, source) {
+    const { url, type } = await uploadMedia(source, `jaaga/site/sections/${sectionKey}`);
+    await this.save({
+      sections: { [sectionKey]: { backgroundUrl: url, backgroundType: type } },
+    });
+    return { url, type };
+  },
+
+  async setAboutHero(source) {
+    const { url, type } = await uploadMedia(source, "jaaga/site/about");
+    await this.save({ about: { hero: { url, type } } });
+    return { url, type };
   },
 };
 
@@ -877,14 +1039,15 @@ export const HistoryAPI = {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export default {
-  auth:        AuthAPI,
-  users:       UsersAPI,
-  posts:       PostsAPI,
-  likes:       LikesAPI,
-  bookmarks:   BookmarksAPI,
-  comments:    CommentsAPI,
-  categories:  CategoriesAPI,
-  subscribers: SubscribersAPI,
-  activity:    ActivityAPI,
-  history:     HistoryAPI,
+  auth:         AuthAPI,
+  users:        UsersAPI,
+  posts:        PostsAPI,
+  likes:        LikesAPI,
+  bookmarks:    BookmarksAPI,
+  comments:     CommentsAPI,
+  categories:   CategoriesAPI,
+  subscribers:  SubscribersAPI,
+  activity:     ActivityAPI,
+  history:      HistoryAPI,
+  siteSettings: SiteSettingsAPI,
 };

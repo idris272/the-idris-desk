@@ -23,8 +23,17 @@ import {
   HistoryAPI,
   UsersAPI,
   AuthAPI,
+  SiteSettingsAPI,
+  DEFAULT_SITE_SETTINGS,
 } from "./lib/db";
+import { uploadMedia } from "./lib/cloudinary";
+import { createUserWithEmailAndPassword } from "firebase/auth";
+import { doc, setDoc, serverTimestamp, getDocs, collection } from "firebase/firestore";
+import { auth, db } from "./lib/firebase";
 import { useAuth, AuthProvider } from "./context/AuthContext";
+import Hero from "./components/Hero";
+import SectionMedia from "./components/SectionMedia";
+import MediaUploader from "./components/MediaUploader";
 
 // ─── CONSTANTS ───────────────────────────────────────────────────────────────
 
@@ -113,16 +122,11 @@ function AppInner() {
   const [posts, setPosts]    = useState([]);
   const [categories, setCategories] = useState([]);
   const [toasts, setToasts]  = useState([]);
+  const [siteSettings, setSiteSettings] = useState(DEFAULT_SITE_SETTINGS);
 
   // ── Routing ────────────────────────────────────────────────────────────
   const setPage = useCallback((p) => {
     setPageState(p);
-    const titles = {
-      home: "Home", categories: "Topics", trending: "Trending", about: "About",
-      admin: "Dashboard", write: "Write", profile: "Profile",
-      bookmarks: "Bookmarks", login: "Sign In", register: "Sign Up",
-    };
-    document.title = `${titles[p.name] || "Article"} — The Jaaga Desk`;
     window.location.hash = pageToHash(p);
     window.scrollTo(0, 0);
   }, []);
@@ -178,21 +182,38 @@ function AppInner() {
 
   // ── Check if first-run setup needed ──────────────────────────────────────
   useEffect(() => {
-    // If nobody is logged in and we're on the home page, check if any users exist
-    if (!currentUser) {
-      import("firebase/firestore").then(({ getDocs, collection }) =>
-        import("./lib/firebase").then(({ db }) =>
-          getDocs(collection(db, "users")).then(snap => {
-            if (snap.empty) {
-              // No users at all — show the admin setup page
-              setPage({ name: "setup" });
-            }
-          })
-        )
-      ).catch(() => {});
-    }
+    if (currentUser) return;
+    getDocs(collection(db, "users"))
+      .then(snap => {
+        if (snap.empty) setPage({ name: "setup" });
+      })
+      .catch(() => {});
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ── Live site settings (logo, hero, section media, footer copy…) ────────
+  useEffect(() => {
+    const unsub = SiteSettingsAPI.onChange((s) => setSiteSettings(s));
+
+    // Safety net for guests if onSnapshot stalls
+    const fallback = setTimeout(() => {
+      SiteSettingsAPI.get().then(s => setSiteSettings(s)).catch(() => {});
+    }, 4000);
+
+    return () => { unsub(); clearTimeout(fallback); };
+  }, []);
+
+  // ── Reactive site identity (title + favicon based on settings) ──────────
+  useEffect(() => {
+    if (siteSettings?.siteName) {
+      const titles = {
+        home: "Home", categories: "Topics", trending: "Trending", about: "About",
+        admin: "Dashboard", write: "Write", profile: "Profile",
+        bookmarks: "Bookmarks", login: "Sign In", register: "Sign Up",
+      };
+      document.title = `${titles[page.name] || "Article"} — ${siteSettings.siteName}`;
+    }
+  }, [siteSettings?.siteName, page.name]);
 
   // ── Load categories once ─────────────────────────────────────────────────
   useEffect(() => {
@@ -248,8 +269,8 @@ function AppInner() {
   // ── Context value ───────────────────────────────────────────────────────
   const contextValue = useMemo(() => ({
     page, setPage, currentUser, theme, toggleTheme,
-    posts, categories, addToast, logout,
-  }), [page, setPage, currentUser, theme, toggleTheme, posts, categories, addToast, logout]);
+    posts, categories, addToast, logout, siteSettings,
+  }), [page, setPage, currentUser, theme, toggleTheme, posts, categories, addToast, logout, siteSettings]);
 
   const renderPage = () => {
     switch (page.name) {
@@ -313,26 +334,16 @@ const AdminSetupPage = () => {
     }
     if (form.password.length < 6) { addToast("Password must be at least 6 characters", "error"); return; }
     setLoading(true);
-    try {
-      // 1. Create the account
-      const cred = await import("firebase/auth").then(m =>
-        m.createUserWithEmailAndPassword(import("./lib/firebase").then(f => f.auth), form.email, form.password)
-      );
-    } catch(e) {}
 
     try {
-      const { createUserWithEmailAndPassword } = await import("firebase/auth");
-      const { doc, setDoc, serverTimestamp } = await import("firebase/firestore");
-      const { auth, db } = await import("./lib/firebase");
-
       const cred = await createUserWithEmailAndPassword(auth, form.email, form.password);
       await setDoc(doc(db, "users", cred.user.uid), {
         uid: cred.user.uid,
         username: form.username,
         displayName: form.displayName,
         email: form.email,
-        role: "admin",         // ← This is the key: first user is ADMIN
-        bio: "Founder & Editor-in-Chief of The Jaaga Desk.",
+        role: "admin",
+        bio: "Founder & Editor-in-Chief.",
         avatar: null,
         verified: true,
         joinedAt: serverTimestamp(),
@@ -341,15 +352,20 @@ const AdminSetupPage = () => {
       setDone(true);
       addToast("Admin account created! Signing you in...", "success");
       setTimeout(async () => {
-        await login({ usernameOrEmail: form.email, password: form.password });
-        setPage({ name: "admin" });
+        try {
+          await login({ usernameOrEmail: form.email, password: form.password });
+          setPage({ name: "admin" });
+        } catch (loginErr) {
+          console.error("Auto-sign-in failed:", loginErr);
+          setPage({ name: "login" });
+        }
       }, 1500);
     } catch (err) {
       console.error(err);
       if (err.message?.includes("email-already-in-use")) {
         addToast("That email is already registered. Use the Sign In page instead.", "error");
       } else {
-        addToast("Setup failed: " + err.message, "error");
+        addToast("Setup failed: " + (err.message || "Unknown error"), "error");
       }
     } finally { setLoading(false); }
   };
@@ -861,11 +877,24 @@ const WritePage = ({ editId = null }) => {
     if (!title.trim() || !content.trim()) { addToast("Title and content required", "error"); return; }
     setSaving(true);
     try {
+      // Upload the cover image BEFORE the post is written, so we never persist
+      // a multi-MB base64 string into Firestore. Falls back gracefully if upload fails.
+      let finalCoverUrl = coverUrl;
+      if (coverUrl && coverUrl.startsWith("data:")) {
+        try {
+          const result = await uploadMedia(coverUrl, "jaaga/covers");
+          finalCoverUrl = result.url;
+        } catch {
+          addToast("Cover image upload failed — saving without it", "error");
+          finalCoverUrl = "";
+        }
+      }
+
       const data = {
         title, content, excerpt,
         category: category || "tech",
         tags:     tags.split(",").map(t => t.trim()).filter(Boolean),
-        coverImage: coverUrl || "https://images.unsplash.com/photo-1499750310107-5fef28a66643?w=800&h=400&fit=crop",
+        coverImage: finalCoverUrl || "",
         status, featured, articleLength,
         authorUid:  currentUser.uid,
         authorName: currentUser.displayName,
@@ -880,11 +909,6 @@ const WritePage = ({ editId = null }) => {
         const created = await PostsAPI.create(data);
         postId = created.id;
         addToast("Article published!", "success");
-      }
-
-      // Handle cover image file upload if user picked a local file
-      if (coverUrl.startsWith("data:")) {
-        await PostsAPI.uploadCoverImage(postId, coverUrl);
       }
 
       setPage({ name: "article", id: postId });
@@ -929,7 +953,7 @@ const WritePage = ({ editId = null }) => {
               <input type="file" ref={fileRef} accept="image/*" style={{ display: "none" }} onChange={e => { const f = e.target.files?.[0]; if (f) { const r = new FileReader(); r.onload = ev => setCoverUrl(ev.target.result); r.readAsDataURL(f); } }} />
               <button onClick={() => fileRef.current?.click()} style={{ padding: "12px 18px", border: "1px solid var(--border)", borderRadius: "var(--radius-md)", background: "var(--bg-card)", cursor: "pointer", color: "var(--text-secondary)", fontSize: 14, display: "flex", alignItems: "center", gap: 6 }}><I n="image" s={16} /> Upload</button>
             </div>
-            {coverUrl && !coverUrl.startsWith("data:") && <div style={{ marginTop: 12, borderRadius: "var(--radius-md)", overflow: "hidden", aspectRatio: "16/6", background: `url(${coverUrl}) center/cover`, border: "1px solid var(--border)" }} />}
+            {coverUrl && <div style={{ marginTop: 12, borderRadius: "var(--radius-md)", overflow: "hidden", aspectRatio: "16/6", background: `url(${coverUrl}) center/cover`, border: "1px solid var(--border)" }} />}
           </div>
           <div><label style={labelStyle}>Excerpt</label><textarea value={excerpt} onChange={e => setExcerpt(e.target.value)} placeholder="Brief summary…" rows={2} style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6 }} /></div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
@@ -1130,8 +1154,13 @@ const AdminDashboard = () => {
 
       {/* Tabs */}
       <div style={{ display: "flex", gap: 8, marginBottom: 24, flexWrap: "wrap" }}>
-        {["overview", "articles", "users", "roles", "comments", "subscribers", "activity"].map(t =>
-          <button key={t} onClick={() => setTab(t)} style={tabBtn(t)}>{t === "roles" ? "👥 Roles" : t.charAt(0).toUpperCase() + t.slice(1)}</button>
+        {["overview", "articles", "site", "categories", "users", "roles", "comments", "subscribers", "activity"].map(t =>
+          <button key={t} onClick={() => setTab(t)} style={tabBtn(t)}>
+            {t === "roles" ? "👥 Roles"
+              : t === "site" ? "🎨 Site Settings"
+              : t === "categories" ? "🗂 Categories"
+              : t.charAt(0).toUpperCase() + t.slice(1)}
+          </button>
         )}
       </div>
 
@@ -1190,6 +1219,12 @@ const AdminDashboard = () => {
           </div>
         </div>
       )}
+
+      {/* Site Settings tab */}
+      {tab === "site" && <SiteSettingsPanel addToast={addToast} />}
+
+      {/* Categories tab */}
+      {tab === "categories" && <CategoriesAdminPanel categories={categories} addToast={addToast} />}
 
       {/* Roles tab */}
       {tab === "roles" && (
@@ -1289,54 +1324,729 @@ const AdminDashboard = () => {
   );
 };
 
+// ─── ADMIN: SITE SETTINGS PANEL ───────────────────────────────────────────────
+// Edit every dynamic surface of the public site: name, tagline, logo,
+// hero slides, section background media, footer copy, social links, etc.
+
+const SECTION_KEYS = [
+  { key: "featured",   label: "Featured (homepage)", helper: "Background behind the Featured Stories block" },
+  { key: "latest",     label: "Latest Stories",      helper: "Background behind the main article grid" },
+  { key: "trending",   label: "Trending sidebar",    helper: "Background behind the trending list" },
+  { key: "topics",     label: "Topics sidebar",      helper: "Background behind the topics pill list" },
+  { key: "newsletter", label: "Newsletter banner",   helper: "Background behind the full-width newsletter call-out" },
+  { key: "categories", label: "Categories page",     helper: "Hero background on the /categories page" },
+  { key: "about",      label: "About page",          helper: "Hero background on the /about page (overrides about.hero)" },
+  { key: "footer",     label: "Footer",              helper: "Background behind the footer" },
+];
+
+const SiteSettingsPanel = ({ addToast }) => {
+  const { siteSettings } = useApp();
+  const [local, setLocal] = useState(siteSettings);
+  const [saving, setSaving] = useState(false);
+
+  // Sync local state whenever the upstream document changes
+  useEffect(() => { setLocal(siteSettings); }, [siteSettings]);
+
+  const setField = (path, value) => {
+    setLocal(prev => {
+      const next = { ...prev };
+      const keys = path.split(".");
+      let target = next;
+      for (let i = 0; i < keys.length - 1; i++) {
+        target[keys[i]] = { ...(target[keys[i]] || {}) };
+        target = target[keys[i]];
+      }
+      target[keys[keys.length - 1]] = value;
+      return next;
+    });
+  };
+
+  const setSectionMedia = (key, url, type) => {
+    setLocal(prev => ({
+      ...prev,
+      sections: {
+        ...(prev.sections || {}),
+        [key]: { backgroundUrl: url, backgroundType: type || "image" },
+      },
+    }));
+  };
+
+  const setHeroSlide = (idx, patch) => {
+    setLocal(prev => {
+      const slides = [...(prev.heroSlides || [])];
+      slides[idx] = { ...slides[idx], ...patch };
+      return { ...prev, heroSlides: slides };
+    });
+  };
+
+  const addSlide = () => {
+    setLocal(prev => ({
+      ...prev,
+      heroSlides: [
+        ...(prev.heroSlides || []),
+        {
+          id: `slide-${Date.now()}`,
+          type: "image",
+          url: "",
+          heading: "",
+          subheading: "",
+          ctaText: "",
+          ctaHref: "",
+          durationMs: 7000,
+        },
+      ],
+    }));
+  };
+
+  const removeSlide = (idx) => {
+    setLocal(prev => ({
+      ...prev,
+      heroSlides: (prev.heroSlides || []).filter((_, i) => i !== idx),
+    }));
+  };
+
+  const moveSlide = (idx, dir) => {
+    setLocal(prev => {
+      const slides = [...(prev.heroSlides || [])];
+      const target = idx + dir;
+      if (target < 0 || target >= slides.length) return prev;
+      [slides[idx], slides[target]] = [slides[target], slides[idx]];
+      return { ...prev, heroSlides: slides };
+    });
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await SiteSettingsAPI.save({
+        siteName:   local.siteName,
+        tagline:    local.tagline,
+        logoUrl:    local.logoUrl,
+        heroSlides: local.heroSlides,
+        sections:   local.sections,
+        about:      local.about,
+        footer:     local.footer,
+        social:     local.social,
+      });
+      addToast("Site settings saved", "success");
+    } catch (err) {
+      console.error(err);
+      addToast("Could not save: " + (err.message || "unknown"), "error");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const cardStyle = {
+    background: "var(--bg-card)", border: "1px solid var(--border)",
+    borderRadius: "var(--radius-lg)", padding: 24, marginBottom: 20,
+  };
+  const h3Style = { fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.125rem", marginBottom: 16 };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+      {/* Identity */}
+      <div style={cardStyle}>
+        <h3 style={h3Style}>Site Identity</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 16 }}>
+          <div>
+            <label style={labelStyle}>Site Name</label>
+            <input value={local.siteName || ""} onChange={e => setField("siteName", e.target.value)} style={inputStyle} />
+          </div>
+          <div>
+            <label style={labelStyle}>Tagline</label>
+            <input value={local.tagline || ""} onChange={e => setField("tagline", e.target.value)} style={inputStyle} />
+          </div>
+        </div>
+        <div style={{ marginTop: 16 }}>
+          <MediaUploader
+            label="Logo (header + footer)"
+            value={local.logoUrl || ""}
+            type="image"
+            accept="image/*"
+            folder="jaaga/site/logo"
+            onChange={(url) => setField("logoUrl", url)}
+            helper="Leave blank to use the first letter of the site name as a colored avatar."
+          />
+        </div>
+      </div>
+
+      {/* Hero slides */}
+      <div style={cardStyle}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <h3 style={{ ...h3Style, marginBottom: 0 }}>Homepage Hero Slides</h3>
+          <button onClick={addSlide} style={{ padding: "8px 16px", border: "none", borderRadius: "var(--radius-xl)", background: "var(--accent)", color: "#fff", cursor: "pointer", fontSize: 13, fontWeight: 600 }}>
+            + Add Slide
+          </button>
+        </div>
+        <p style={{ fontSize: 13, color: "var(--text-tertiary)", marginBottom: 16 }}>
+          Each slide can be an image or a video. The hero auto-advances with the duration set per slide.
+        </p>
+        {(local.heroSlides || []).length === 0 && (
+          <p style={{ fontSize: 14, color: "var(--text-tertiary)", padding: 24, textAlign: "center", background: "var(--bg-secondary)", borderRadius: "var(--radius-md)" }}>
+            No slides yet — click <strong>Add Slide</strong> to create one.
+          </p>
+        )}
+        <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          {(local.heroSlides || []).map((slide, idx) => (
+            <div key={slide.id || idx} style={{
+              border: "1px solid var(--border)", borderRadius: "var(--radius-md)",
+              padding: 20, background: "var(--bg-secondary)",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                <strong style={{ fontSize: 14 }}>Slide {idx + 1}</strong>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => moveSlide(idx, -1)} disabled={idx === 0}
+                    style={{ padding: "5px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-card)", cursor: idx === 0 ? "default" : "pointer", opacity: idx === 0 ? 0.4 : 1, fontSize: 12 }}>↑</button>
+                  <button onClick={() => moveSlide(idx, 1)} disabled={idx === (local.heroSlides.length - 1)}
+                    style={{ padding: "5px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-card)", cursor: idx === local.heroSlides.length - 1 ? "default" : "pointer", opacity: idx === local.heroSlides.length - 1 ? 0.4 : 1, fontSize: 12 }}>↓</button>
+                  <button onClick={() => removeSlide(idx)} style={{ padding: "5px 10px", border: "1px solid var(--border)", borderRadius: "var(--radius-sm)", background: "var(--bg-card)", color: "#ef4444", cursor: "pointer", fontSize: 12 }}>Remove</button>
+                </div>
+              </div>
+              <MediaUploader
+                label="Slide media (image or video)"
+                value={slide.url || ""}
+                type={slide.type || "image"}
+                accept="image/*,video/*"
+                folder="jaaga/site/hero"
+                onChange={(url, detected) => setHeroSlide(idx, { url, type: detected })}
+              />
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 12 }}>
+                <div>
+                  <label style={labelStyle}>Heading</label>
+                  <input value={slide.heading || ""} onChange={e => setHeroSlide(idx, { heading: e.target.value })} style={inputStyle} placeholder="Stories that illuminate" />
+                </div>
+                <div>
+                  <label style={labelStyle}>Subheading</label>
+                  <input value={slide.subheading || ""} onChange={e => setHeroSlide(idx, { subheading: e.target.value })} style={inputStyle} placeholder="A digital publication..." />
+                </div>
+                <div>
+                  <label style={labelStyle}>CTA Text</label>
+                  <input value={slide.ctaText || ""} onChange={e => setHeroSlide(idx, { ctaText: e.target.value })} style={inputStyle} placeholder="Explore Stories" />
+                </div>
+                <div>
+                  <label style={labelStyle}>CTA Link (href)</label>
+                  <input value={slide.ctaHref || ""} onChange={e => setHeroSlide(idx, { ctaHref: e.target.value })} style={inputStyle} placeholder="#/trending" />
+                </div>
+                <div>
+                  <label style={labelStyle}>Duration (ms)</label>
+                  <input type="number" min="2000" step="500" value={slide.durationMs || 7000} onChange={e => setHeroSlide(idx, { durationMs: Number(e.target.value) || 7000 })} style={inputStyle} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Type</label>
+                  <select value={slide.type || "image"} onChange={e => setHeroSlide(idx, { type: e.target.value })} style={inputStyle}>
+                    <option value="image">Image</option>
+                    <option value="video">Video</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Section backgrounds */}
+      <div style={cardStyle}>
+        <h3 style={h3Style}>Section Backgrounds</h3>
+        <p style={{ fontSize: 13, color: "var(--text-tertiary)", marginBottom: 16 }}>
+          Set an image or video behind any section of the site. Leave blank to use a plain background.
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(280px,1fr))", gap: 20 }}>
+          {SECTION_KEYS.map(({ key, label, helper }) => {
+            const sec = local.sections?.[key] || {};
+            return (
+              <div key={key} style={{ border: "1px solid var(--border)", borderRadius: "var(--radius-md)", padding: 16, background: "var(--bg-secondary)" }}>
+                <MediaUploader
+                  label={label}
+                  value={sec.backgroundUrl || ""}
+                  type={sec.backgroundType || "image"}
+                  accept="image/*,video/*"
+                  folder={`jaaga/site/sections/${key}`}
+                  onChange={(url, detected) => setSectionMedia(key, url, detected)}
+                  helper={helper}
+                />
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* About page */}
+      <div style={cardStyle}>
+        <h3 style={h3Style}>About Page</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
+          <MediaUploader
+            label="About hero media (image or video)"
+            value={local.about?.hero?.url || ""}
+            type={local.about?.hero?.type || "image"}
+            accept="image/*,video/*"
+            folder="jaaga/site/about"
+            onChange={(url, detected) => setField("about.hero", { url, type: detected })}
+          />
+          <div>
+            <label style={labelStyle}>Title</label>
+            <input value={local.about?.title || ""} onChange={e => setField("about.title", e.target.value)} style={inputStyle} />
+          </div>
+          <div>
+            <label style={labelStyle}>Body (paragraphs separated by blank lines)</label>
+            <textarea value={local.about?.body || ""} onChange={e => setField("about.body", e.target.value)} rows={8} style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6 }} />
+          </div>
+          <div>
+            <label style={labelStyle}>Contact Email</label>
+            <input value={local.about?.contactEmail || ""} onChange={e => setField("about.contactEmail", e.target.value)} style={inputStyle} placeholder="hello@example.com" />
+          </div>
+        </div>
+      </div>
+
+      {/* Footer copy */}
+      <div style={cardStyle}>
+        <h3 style={h3Style}>Footer</h3>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
+          <div>
+            <label style={labelStyle}>Blurb (short paragraph under the logo)</label>
+            <textarea value={local.footer?.blurb || ""} onChange={e => setField("footer.blurb", e.target.value)} rows={3} style={{ ...inputStyle, resize: "vertical", lineHeight: 1.6 }} />
+          </div>
+          <div>
+            <label style={labelStyle}>Copyright line</label>
+            <input value={local.footer?.copyright || ""} onChange={e => setField("footer.copyright", e.target.value)} style={inputStyle} placeholder={`© ${new Date().getFullYear()} ${local.siteName || "Site"}`} />
+          </div>
+        </div>
+      </div>
+
+      {/* Social links */}
+      <div style={cardStyle}>
+        <h3 style={h3Style}>Social Links</h3>
+        <p style={{ fontSize: 13, color: "var(--text-tertiary)", marginBottom: 16 }}>
+          Add full URLs (https://…). Leave blank to hide the icon in the footer.
+        </p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 16 }}>
+          {["twitter", "instagram", "facebook", "youtube", "linkedin", "tiktok"].map(net => (
+            <div key={net}>
+              <label style={labelStyle}>{net.charAt(0).toUpperCase() + net.slice(1)}</label>
+              <input
+                value={local.social?.[net] || ""}
+                onChange={e => setField(`social.${net}`, e.target.value)}
+                placeholder={`https://${net}.com/...`}
+                style={inputStyle}
+              />
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Save bar */}
+      <div style={{
+        position: "sticky", bottom: 24, padding: "12px 16px",
+        background: "var(--bg-card)", border: "1px solid var(--border)",
+        borderRadius: "var(--radius-xl)", boxShadow: "var(--shadow-lg)",
+        display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12,
+      }}>
+        <span style={{ fontSize: 13, color: "var(--text-tertiary)" }}>
+          Changes are saved to <code>settings/site</code> and reflect across the site in real time.
+        </span>
+        <button onClick={handleSave} disabled={saving}
+          style={{ padding: "12px 28px", border: "none", borderRadius: "var(--radius-xl)", background: "var(--accent)", color: "#fff", cursor: saving ? "default" : "pointer", fontSize: 14, fontWeight: 600, opacity: saving ? 0.7 : 1 }}>
+          {saving ? "Saving…" : "Save Settings"}
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// ─── ADMIN: CATEGORIES PANEL ──────────────────────────────────────────────────
+
+const CategoriesAdminPanel = ({ categories, addToast }) => {
+  const [local, setLocal] = useState(categories || []);
+  const [saving, setSaving] = useState(null);
+
+  useEffect(() => { setLocal(categories || []); }, [categories]);
+
+  const patch = (id, updates) => {
+    setLocal(prev => prev.map(c => c.id === id ? { ...c, ...updates } : c));
+  };
+
+  const saveOne = async (cat) => {
+    setSaving(cat.id);
+    try {
+      await CategoriesAPI.update(cat.id, {
+        name: cat.name,
+        icon: cat.icon,
+        color: cat.color,
+        description: cat.description,
+        coverImage: cat.coverImage || "",
+        coverType: cat.coverType || "image",
+      });
+      addToast(`${cat.name} updated`, "success");
+    } catch (err) {
+      addToast("Failed to save: " + (err.message || "unknown"), "error");
+    } finally { setSaving(null); }
+  };
+
+  return (
+    <div>
+      <p style={{ fontSize: 13, color: "var(--text-tertiary)", marginBottom: 16 }}>
+        Edit the name, accent color, and cover media for each topic. Cover media appears on the
+        Categories page card and at the top of the category page.
+      </p>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(320px,1fr))", gap: 16 }}>
+        {local.map(cat => (
+          <div key={cat.id} style={{
+            background: "var(--bg-card)", border: "1px solid var(--border)",
+            borderRadius: "var(--radius-lg)", padding: 20,
+            borderLeft: `4px solid ${cat.color || "#c45d3e"}`,
+          }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+              <span style={{ fontSize: 28 }}>{cat.icon}</span>
+              <span style={{ fontWeight: 700 }}>{cat.id}</span>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div>
+                <label style={labelStyle}>Name</label>
+                <input value={cat.name || ""} onChange={e => patch(cat.id, { name: e.target.value })} style={inputStyle} />
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div>
+                  <label style={labelStyle}>Icon (emoji)</label>
+                  <input value={cat.icon || ""} onChange={e => patch(cat.id, { icon: e.target.value })} style={inputStyle} />
+                </div>
+                <div>
+                  <label style={labelStyle}>Accent color</label>
+                  <input type="color" value={cat.color || "#c45d3e"} onChange={e => patch(cat.id, { color: e.target.value })} style={{ ...inputStyle, padding: 4, height: 42 }} />
+                </div>
+              </div>
+              <div>
+                <label style={labelStyle}>Description</label>
+                <textarea value={cat.description || ""} onChange={e => patch(cat.id, { description: e.target.value })} rows={2} style={{ ...inputStyle, resize: "vertical" }} />
+              </div>
+              <MediaUploader
+                label="Cover media"
+                value={cat.coverImage || ""}
+                type={cat.coverType || "image"}
+                accept="image/*,video/*"
+                folder={`jaaga/categories/${cat.id}`}
+                onChange={(url, detected) => patch(cat.id, { coverImage: url, coverType: detected })}
+              />
+              <button onClick={() => saveOne(cat)} disabled={saving === cat.id}
+                style={{ alignSelf: "flex-end", padding: "10px 20px", border: "none", borderRadius: "var(--radius-xl)", background: "var(--accent)", color: "#fff", cursor: saving === cat.id ? "default" : "pointer", fontSize: 13, fontWeight: 600, opacity: saving === cat.id ? 0.7 : 1 }}>
+                {saving === cat.id ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+
 // ─── REMAINING PAGE COMPONENTS ────────────────────────────────────────────────
 // These are simpler and use the same pattern — read from Firebase via context
 
 const HomePage = () => {
-  const { posts, categories, setPage } = useApp();
+  const { posts, categories, setPage, siteSettings } = useApp();
   const pub      = posts.filter(p => p.status === "published");
   const feat     = pub.filter(p => p.featured).slice(0, 2);
   const latest   = pub.slice(0, 9);
   const trending = [...pub].sort((a, b) => (b.views || 0) - (a.views || 0)).slice(0, 5);
+
+  const sec = siteSettings?.sections || {};
+  const featSec  = sec.featured   || {};
+  const latestSec= sec.latest     || {};
+  const trendSec = sec.trending   || {};
+  const topicsSec= sec.topics     || {};
+  const newsSec  = sec.newsletter || {};
+
   return (
     <div>
-      {feat.length > 0 && <section className="container" style={{ paddingTop: 40, paddingBottom: 32 }}><div style={{ display: "grid", gap: 24 }}>{feat.map((a, i) => <ArticleCard key={a.id} article={a} variant="featured" index={i} />)}</div></section>}
-      <section className="container" style={{ paddingBottom: 48 }}>
-        <div className="main-grid" style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 48 }}>
-          <div>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}><h2 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.5rem" }}>Latest Stories</h2><span style={{ fontSize: 13, color: "var(--text-tertiary)" }}>{pub.length} articles</span></div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 24 }}>{latest.map((a, i) => <ArticleCard key={a.id} article={a} index={i} />)}</div>
-          </div>
-          <aside>
-            <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 24, marginBottom: 24 }}>
-              <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.125rem", marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}><I n="trend" s={18} /> Trending Now</h3>
-              {trending.map((a, i) => (
-                <div key={a.id} onClick={() => setPage({ name: "article", id: a.id })} style={{ cursor: "pointer", display: "flex", gap: 12, padding: "12px 0", borderBottom: i < trending.length - 1 ? "1px solid var(--border-light)" : "none" }}>
-                  <span style={{ fontFamily: "var(--font-display)", fontSize: 24, fontWeight: 700, color: "var(--border)", lineHeight: 1, minWidth: 28 }}>{String(i + 1).padStart(2, "0")}</span>
-                  <div><h4 style={{ fontSize: 14, fontWeight: 600, lineHeight: 1.35, marginBottom: 2 }}>{a.title}</h4><span style={{ fontSize: 12, color: "var(--text-tertiary)" }}>{a.readTime}m · {a.views?.toLocaleString()} views</span></div>
+      {/* ── Full-screen hero ── */}
+      <Hero
+        slides={siteSettings?.heroSlides}
+        fallbackHeading={siteSettings?.tagline || "Stories that illuminate"}
+        fallbackSubheading="Add hero slides in the admin dashboard to customise this view."
+      />
+
+      {/* ── Featured (media background) ── */}
+      {feat.length > 0 && (
+        <SectionMedia
+          url={featSec.backgroundUrl}
+          type={featSec.backgroundType}
+          overlay="linear-gradient(180deg, rgba(0,0,0,0.55), rgba(0,0,0,0.7))"
+        >
+          <section className="container" style={{ paddingTop: 64, paddingBottom: 48 }}>
+            <div style={{ marginBottom: 28, color: featSec.backgroundUrl ? "#fff" : "inherit" }}>
+              <h2 style={{
+                fontFamily: "var(--font-display)", fontWeight: 700,
+                fontSize: "clamp(1.5rem,3vw,2rem)",
+                color: featSec.backgroundUrl ? "#fff" : "var(--text-primary)",
+                textShadow: featSec.backgroundUrl ? "0 2px 12px rgba(0,0,0,0.4)" : "none",
+              }}>Featured Stories</h2>
+              <div style={{ width: 48, height: 3, background: "var(--accent)", marginTop: 12, borderRadius: 2 }} />
+            </div>
+            <div style={{ display: "grid", gap: 24 }}>
+              {feat.map((a, i) => <ArticleCard key={a.id} article={a} variant="featured" index={i} />)}
+            </div>
+          </section>
+        </SectionMedia>
+      )}
+
+      {/* ── Latest + sidebar (latest section has its own media bg) ── */}
+      <SectionMedia
+        url={latestSec.backgroundUrl}
+        type={latestSec.backgroundType}
+        overlay="rgba(255,255,255,0.86)"
+      >
+        <section className="container" style={{ paddingTop: 64, paddingBottom: 64 }}>
+          <div className="main-grid" style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 48 }}>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 24 }}>
+                <h2 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "clamp(1.5rem,3vw,2rem)" }}>Latest Stories</h2>
+                <span style={{ fontSize: 13, color: "var(--text-tertiary)" }}>{pub.length} article{pub.length === 1 ? "" : "s"}</span>
+              </div>
+              {latest.length === 0 ? (
+                <div style={{ textAlign: "center", padding: 60, background: "var(--bg-card)", borderRadius: "var(--radius-lg)", border: "1px solid var(--border)" }}>
+                  <p style={{ fontSize: 36, marginBottom: 12 }}>📝</p>
+                  <p style={{ color: "var(--text-tertiary)" }}>No stories published yet.</p>
                 </div>
-              ))}
+              ) : (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 24 }}>
+                  {latest.map((a, i) => <ArticleCard key={a.id} article={a} index={i} />)}
+                </div>
+              )}
             </div>
-            <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 24, marginBottom: 24 }}>
-              <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.125rem", marginBottom: 16 }}>Explore Topics</h3>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>{categories?.map(c => <button key={c.id} onClick={() => setPage({ name: "category", id: c.id })} style={{ padding: "8px 14px", borderRadius: "var(--radius-xl)", border: "1px solid var(--border)", background: "var(--bg-primary)", cursor: "pointer", fontSize: 13, fontWeight: 500, color: "var(--text-secondary)" }}>{c.icon} {c.name}</button>)}</div>
-            </div>
-            <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 24 }}>
-              <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.125rem", marginBottom: 8 }}>Newsletter</h3>
-              <NewsletterSection variant="minimal" />
-            </div>
-            <AdSlot slot="sidebar" label="Sponsored" />
-          </aside>
+
+            <aside style={{ display: "flex", flexDirection: "column", gap: 24 }}>
+              {/* Trending (media-backed) */}
+              <SectionMedia
+                url={trendSec.backgroundUrl}
+                type={trendSec.backgroundType}
+                overlay="rgba(0,0,0,0.55)"
+                rounded
+              >
+                <div style={{ padding: 24, color: trendSec.backgroundUrl ? "#fff" : "var(--text-primary)" }}>
+                  <h3 style={{
+                    fontFamily: "var(--font-display)", fontWeight: 700,
+                    fontSize: "1.125rem", marginBottom: 12,
+                    display: "flex", alignItems: "center", gap: 8,
+                  }}><I n="trend" s={18} /> Trending Now</h3>
+                  {trending.length === 0
+                    ? <p style={{ fontSize: 13, color: trendSec.backgroundUrl ? "rgba(255,255,255,0.7)" : "var(--text-tertiary)" }}>No data yet.</p>
+                    : trending.map((a, i) => (
+                      <div key={a.id} onClick={() => setPage({ name: "article", id: a.id })}
+                        style={{
+                          cursor: "pointer", display: "flex", gap: 12, padding: "12px 0",
+                          borderBottom: i < trending.length - 1
+                            ? (trendSec.backgroundUrl ? "1px solid rgba(255,255,255,0.15)" : "1px solid var(--border-light)")
+                            : "none",
+                        }}>
+                        <span style={{
+                          fontFamily: "var(--font-display)", fontSize: 24, fontWeight: 700,
+                          color: trendSec.backgroundUrl ? "rgba(255,255,255,0.35)" : "var(--border)",
+                          lineHeight: 1, minWidth: 28,
+                        }}>{String(i + 1).padStart(2, "0")}</span>
+                        <div>
+                          <h4 style={{ fontSize: 14, fontWeight: 600, lineHeight: 1.35, marginBottom: 2 }}>{a.title}</h4>
+                          <span style={{ fontSize: 12, color: trendSec.backgroundUrl ? "rgba(255,255,255,0.7)" : "var(--text-tertiary)" }}>
+                            {a.readTime}m · {(a.views || 0).toLocaleString()} views
+                          </span>
+                        </div>
+                      </div>
+                    ))
+                  }
+                </div>
+              </SectionMedia>
+
+              {/* Explore topics (media-backed) */}
+              <SectionMedia
+                url={topicsSec.backgroundUrl}
+                type={topicsSec.backgroundType}
+                overlay="rgba(255,255,255,0.94)"
+                rounded
+              >
+                <div style={{ padding: 24, background: topicsSec.backgroundUrl ? "transparent" : "var(--bg-card)", border: topicsSec.backgroundUrl ? "none" : "1px solid var(--border)", borderRadius: "var(--radius-lg)" }}>
+                  <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.125rem", marginBottom: 16 }}>Explore Topics</h3>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                    {categories?.map(c => (
+                      <button key={c.id} onClick={() => setPage({ name: "category", id: c.id })}
+                        style={{
+                          padding: "8px 14px", borderRadius: "var(--radius-xl)",
+                          border: "1px solid var(--border)", background: "var(--bg-primary)",
+                          cursor: "pointer", fontSize: 13, fontWeight: 500,
+                          color: "var(--text-secondary)",
+                        }}>{c.icon} {c.name}</button>
+                    ))}
+                  </div>
+                </div>
+              </SectionMedia>
+
+              {/* Newsletter (media-backed in sidebar variant) */}
+              <SectionMedia
+                url={newsSec.backgroundUrl}
+                type={newsSec.backgroundType}
+                overlay="rgba(0,0,0,0.5)"
+                rounded
+              >
+                <div style={{ padding: 24, color: newsSec.backgroundUrl ? "#fff" : "var(--text-primary)" }}>
+                  <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.125rem", marginBottom: 8 }}>Newsletter</h3>
+                  <p style={{ fontSize: 13, color: newsSec.backgroundUrl ? "rgba(255,255,255,0.85)" : "var(--text-tertiary)", marginBottom: 14 }}>
+                    Get the latest stories in your inbox.
+                  </p>
+                  <NewsletterSection variant="minimal" />
+                </div>
+              </SectionMedia>
+
+              <AdSlot slot="sidebar" label="Sponsored" />
+            </aside>
+          </div>
+        </section>
+      </SectionMedia>
+
+      {/* ── Full-width newsletter banner ── */}
+      <SectionMedia
+        url={newsSec.backgroundUrl}
+        type={newsSec.backgroundType}
+        overlay="linear-gradient(180deg, rgba(0,0,0,0.6), rgba(0,0,0,0.75))"
+      >
+        <div className="container" style={{ paddingTop: 56, paddingBottom: 56 }}>
+          <NewsletterSection variant={newsSec.backgroundUrl ? "overlay" : "default"} />
         </div>
-      </section>
-      <div className="container"><NewsletterSection /></div>
+      </SectionMedia>
+
       <RecommendationWidget />
     </div>
   );
 };
 
-const CategoriesPage = () => { const { categories, posts, setPage } = useApp(); return <div className="container" style={{ padding: "40px 24px 80px" }}><h1 className="anim-up" style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "clamp(1.75rem,3vw,2.5rem)", marginBottom: 32, textAlign: "center" }}>Explore Topics</h1><div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 20, maxWidth: 900, margin: "0 auto" }}>{categories?.map((c, i) => { const cnt = posts.filter(p => p.category === c.id && p.status === "published").length; return <div key={c.id} className="anim-in" onClick={() => setPage({ name: "category", id: c.id })} style={{ padding: 28, background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", cursor: "pointer", animationDelay: `${i * .05}s`, animationFillMode: "backwards", borderLeft: `4px solid ${c.color}` }}><span style={{ fontSize: 32, marginBottom: 12, display: "block" }}>{c.icon}</span><h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.25rem", marginBottom: 4 }}>{c.name}</h3><p style={{ fontSize: 13, color: "var(--text-tertiary)", marginBottom: 4 }}>{c.description}</p><p style={{ fontSize: 14, color: "var(--text-tertiary)" }}>{cnt} article{cnt !== 1 ? "s" : ""}</p></div>; })}</div></div>; };
-const CategoryPage = ({ categoryId }) => { const { categories, posts, setPage } = useApp(); const cat = categories?.find(c => c.id === categoryId); const cp = posts.filter(p => p.category === categoryId && p.status === "published"); return <div className="container" style={{ padding: "40px 24px 80px" }}><div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 24, fontSize: 13, color: "var(--text-tertiary)" }}><span style={{ cursor: "pointer" }} onClick={() => setPage({ name: "home" })}>Home</span><I n="chevRight" s={12} /><span style={{ cursor: "pointer" }} onClick={() => setPage({ name: "categories" })}>Categories</span><I n="chevRight" s={12} /><span style={{ color: cat?.color }}>{cat?.name}</span></div><div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 32 }}><span style={{ fontSize: 48 }}>{cat?.icon}</span><div><h1 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "2rem" }}>{cat?.name}</h1><p style={{ color: "var(--text-tertiary)", fontSize: 14 }}>{cp.length} articles</p></div></div>{cp.length === 0 ? <p style={{ textAlign: "center", padding: 60, color: "var(--text-tertiary)" }}>No articles yet.</p> : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))", gap: 24 }}>{cp.map((p, i) => <ArticleCard key={p.id} article={p} index={i} />)}</div>}</div>; };
+const CategoriesPage = () => {
+  const { categories, posts, setPage, siteSettings } = useApp();
+  const catSec = siteSettings?.sections?.categories || {};
+  return (
+    <div>
+      <SectionMedia
+        url={catSec.backgroundUrl}
+        type={catSec.backgroundType}
+        overlay="linear-gradient(180deg, rgba(0,0,0,0.4), rgba(0,0,0,0.6))"
+        minHeight={catSec.backgroundUrl ? "clamp(220px, 30vh, 340px)" : 0}
+      >
+        {catSec.backgroundUrl ? (
+          <div style={{
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+            minHeight: "clamp(220px, 30vh, 340px)", color: "#fff", padding: "32px 24px", textAlign: "center",
+          }}>
+            <h1 className="anim-up" style={{ fontFamily: "var(--font-display)", fontWeight: 800, fontSize: "clamp(2rem,4vw,3rem)", textShadow: "0 2px 12px rgba(0,0,0,0.4)" }}>Explore Topics</h1>
+            <p style={{ marginTop: 12, fontSize: 16, opacity: 0.9, maxWidth: 520 }}>Find stories you care about.</p>
+          </div>
+        ) : (
+          <h1 className="anim-up" style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "clamp(1.75rem,3vw,2.5rem)", margin: "40px 0 0", textAlign: "center" }}>Explore Topics</h1>
+        )}
+      </SectionMedia>
+
+      <div className="container" style={{ padding: "40px 24px 80px" }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 20, maxWidth: 1100, margin: "0 auto" }}>
+          {categories?.map((c, i) => {
+            const cnt = posts.filter(p => p.category === c.id && p.status === "published").length;
+            const cover = c.coverImage;
+            const isVideo = c.coverType === "video";
+            return (
+              <div key={c.id} className="anim-in"
+                onClick={() => setPage({ name: "category", id: c.id })}
+                style={{
+                  position: "relative",
+                  overflow: "hidden",
+                  background: "var(--bg-card)",
+                  border: "1px solid var(--border)",
+                  borderRadius: "var(--radius-lg)",
+                  cursor: "pointer",
+                  animationDelay: `${i * .05}s`, animationFillMode: "backwards",
+                  borderLeft: `4px solid ${c.color || "#c45d3e"}`,
+                  minHeight: cover ? 220 : "auto",
+                  display: "flex", flexDirection: "column",
+                  transition: "transform .2s ease, box-shadow .2s ease",
+                }}
+                onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-3px)"; e.currentTarget.style.boxShadow = "var(--shadow-md)"; }}
+                onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = "none"; }}
+              >
+                {cover && (
+                  <div style={{ position: "relative", height: 140, overflow: "hidden" }}>
+                    {isVideo ? (
+                      <video src={cover} autoPlay muted loop playsInline
+                        style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                    ) : (
+                      <div style={{ width: "100%", height: "100%", backgroundImage: `url(${cover})`, backgroundSize: "cover", backgroundPosition: "center" }} />
+                    )}
+                    <div style={{ position: "absolute", inset: 0, background: `linear-gradient(180deg, rgba(0,0,0,0.0) 0%, ${c.color || "#000"}33 100%)` }} />
+                  </div>
+                )}
+                <div style={{ padding: 24, flex: 1 }}>
+                  <span style={{ fontSize: 32, marginBottom: 12, display: "block" }}>{c.icon}</span>
+                  <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.25rem", marginBottom: 6 }}>{c.name}</h3>
+                  <p style={{ fontSize: 13, color: "var(--text-tertiary)", marginBottom: 8, lineHeight: 1.5 }}>{c.description}</p>
+                  <p style={{ fontSize: 13, color: "var(--text-tertiary)", fontWeight: 500 }}>{cnt} article{cnt !== 1 ? "s" : ""}</p>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+const CategoryPage = ({ categoryId }) => {
+  const { categories, posts, setPage } = useApp();
+  const cat = categories?.find(c => c.id === categoryId);
+  const cp = posts.filter(p => p.category === categoryId && p.status === "published");
+  const cover = cat?.coverImage;
+  const isVideo = cat?.coverType === "video";
+
+  return (
+    <div>
+      <SectionMedia
+        url={cover}
+        type={isVideo ? "video" : "image"}
+        overlay={cover
+          ? `linear-gradient(180deg, rgba(0,0,0,0.45), ${(cat?.color || "#000")}cc)`
+          : ""}
+        minHeight={cover ? "clamp(260px, 36vh, 400px)" : 0}
+      >
+        <div className="container" style={{
+          display: "flex", flexDirection: "column", justifyContent: "center",
+          minHeight: cover ? "clamp(260px, 36vh, 400px)" : "auto",
+          padding: cover ? "40px 24px" : "40px 24px 0",
+          color: cover ? "#fff" : "inherit",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 16, fontSize: 13, color: cover ? "rgba(255,255,255,0.85)" : "var(--text-tertiary)" }}>
+            <span style={{ cursor: "pointer" }} onClick={() => setPage({ name: "home" })}>Home</span>
+            <I n="chevRight" s={12} />
+            <span style={{ cursor: "pointer" }} onClick={() => setPage({ name: "categories" })}>Categories</span>
+            <I n="chevRight" s={12} />
+            <span>{cat?.name}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+            <span style={{ fontSize: 56 }}>{cat?.icon}</span>
+            <div>
+              <h1 style={{
+                fontFamily: "var(--font-display)", fontWeight: 800,
+                fontSize: "clamp(2rem,4vw,3rem)",
+                textShadow: cover ? "0 2px 12px rgba(0,0,0,0.4)" : "none",
+              }}>{cat?.name}</h1>
+              <p style={{ color: cover ? "rgba(255,255,255,0.85)" : "var(--text-tertiary)", fontSize: 14 }}>{cp.length} article{cp.length === 1 ? "" : "s"}</p>
+            </div>
+          </div>
+        </div>
+      </SectionMedia>
+
+      <div className="container" style={{ padding: "40px 24px 80px" }}>
+        {cp.length === 0 ? (
+          <p style={{ textAlign: "center", padding: 60, color: "var(--text-tertiary)" }}>No articles yet.</p>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))", gap: 24 }}>
+            {cp.map((p, i) => <ArticleCard key={p.id} article={p} index={i} />)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
 const TrendingPage = () => { const { posts } = useApp(); const t = [...posts].filter(p => p.status === "published").sort((a, b) => (b.views || 0) - (a.views || 0)); return <div className="container" style={{ padding: "40px 24px 80px", maxWidth: 900, margin: "0 auto" }}><div style={{ textAlign: "center", marginBottom: 40 }}><h1 className="anim-up" style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "clamp(1.75rem,3vw,2.5rem)", display: "flex", alignItems: "center", justifyContent: "center", gap: 12 }}><I n="fire" s={32} /> Trending</h1></div><div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 24 }}>{t.map((p, i) => <ArticleCard key={p.id} article={p} index={i} />)}</div></div>; };
 const SearchPage = ({ query }) => { const { posts } = useApp(); if (!query) return null; const q = query.toLowerCase(); const r = posts.filter(p => p.status === "published" && (p.title?.toLowerCase().includes(q) || p.content?.toLowerCase().includes(q) || p.tags?.some(t => t.toLowerCase().includes(q)) || p.excerpt?.toLowerCase().includes(q))); return <div className="container" style={{ padding: "40px 24px 80px", maxWidth: 900, margin: "0 auto" }}><div style={{ marginBottom: 32 }}><p style={{ fontSize: 14, color: "var(--text-tertiary)", marginBottom: 4 }}>Results for</p><h1 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.75rem" }}>"{query}"</h1><p style={{ color: "var(--text-tertiary)", fontSize: 14, marginTop: 4 }}>{r.length} result{r.length !== 1 ? "s" : ""}</p></div>{r.length === 0 ? <div style={{ textAlign: "center", padding: 60 }}><p style={{ fontSize: 48, marginBottom: 16 }}>🔍</p><p style={{ color: "var(--text-tertiary)" }}>No articles found.</p></div> : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 24 }}>{r.map((p, i) => <ArticleCard key={p.id} article={p} index={i} />)}</div>}</div>; };
 
@@ -1349,7 +2059,64 @@ const BookmarksPage = () => {
   return <div className="container" style={{ padding: "40px 24px 80px", maxWidth: 900, margin: "0 auto" }}><h1 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.75rem", marginBottom: 32 }}><I n="bookmark" s={24} style={{ verticalAlign: "middle", marginRight: 8 }} /> Bookmarks</h1>{bm.length === 0 ? <div style={{ textAlign: "center", padding: 60 }}><p style={{ fontSize: 48, marginBottom: 16 }}>📑</p><p style={{ color: "var(--text-tertiary)" }}>No bookmarks yet.</p></div> : <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(280px,1fr))", gap: 24 }}>{bm.map((p, i) => <ArticleCard key={p.id} article={p} index={i} />)}</div>}</div>;
 };
 
-const AboutPage = () => <div className="container" style={{ maxWidth: 720, margin: "0 auto", padding: "48px 24px 80px" }}><div className="anim-up"><h1 style={{ fontFamily: "var(--font-display)", fontWeight: 800, fontSize: "clamp(2rem,4vw,3rem)", marginBottom: 24, lineHeight: 1.2, textAlign: "center" }}>About The Jaaga Desk</h1><div style={{ width: 60, height: 4, borderRadius: 2, background: "var(--accent)", margin: "0 auto 40px" }} /><div style={{ fontSize: "1.125rem", lineHeight: 1.85, color: "var(--text-secondary)" }}><p style={{ marginBottom: 20 }}>The Jaaga Desk is a digital publication rooted in Northern Ghanaian heritage, dedicated to delivering thoughtful stories that inform, inspire, and illuminate.</p><p style={{ marginBottom: 20 }}>"Jaaga" carries the meaning of "a place" and "to be awake" — this space is both a gathering point and a call to consciousness.</p><p style={{ marginBottom: 32 }}>From technology to culture, science to food, travel to opinion — we explore the ideas that shape our world, always with depth and a distinctive perspective.</p><div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 32 }}><h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.25rem", marginBottom: 16 }}>Contact</h3><p style={{ fontSize: 14, color: "var(--text-secondary)" }}>Email: <a href="mailto:hello@idrisjaaga.com" style={{ color: "var(--accent)" }}>hello@idrisjaaga.com</a></p></div></div></div><NewsletterSection /></div>;
+const AboutPage = () => {
+  const { siteSettings } = useApp();
+  const about     = siteSettings?.about     || {};
+  const aboutSec  = siteSettings?.sections?.about || {};
+  const hero      = about.hero || {};
+  const contactEm = about.contactEmail || "hello@idrisjaaga.com";
+  const title     = about.title || `About ${siteSettings?.siteName || "The Jaaga Desk"}`;
+  const paragraphs = (about.body || "").split(/\n\s*\n/).filter(Boolean);
+
+  return (
+    <div>
+      {/* Hero with media background */}
+      <SectionMedia
+        url={hero.url || aboutSec.backgroundUrl}
+        type={hero.type || aboutSec.backgroundType}
+        overlay="linear-gradient(180deg, rgba(0,0,0,0.45), rgba(0,0,0,0.7))"
+        minHeight={hero.url || aboutSec.backgroundUrl ? "clamp(280px, 40vh, 460px)" : 0}
+      >
+        {(hero.url || aboutSec.backgroundUrl) && (
+          <div className="container" style={{
+            display: "flex", flexDirection: "column", justifyContent: "center",
+            minHeight: "clamp(280px, 40vh, 460px)", color: "#fff", padding: "48px 24px",
+          }}>
+            <h1 className="anim-up" style={{
+              fontFamily: "var(--font-display)", fontWeight: 800,
+              fontSize: "clamp(2rem,4.5vw,3.5rem)", lineHeight: 1.1,
+              textAlign: "center", maxWidth: 820, margin: "0 auto",
+              textShadow: "0 2px 16px rgba(0,0,0,0.4)",
+            }}>{title}</h1>
+            <div style={{ width: 60, height: 4, borderRadius: 2, background: "var(--accent)", margin: "20px auto 0" }} />
+          </div>
+        )}
+      </SectionMedia>
+
+      <div className="container" style={{ maxWidth: 720, margin: "0 auto", padding: "48px 24px 80px" }}>
+        {!(hero.url || aboutSec.backgroundUrl) && (
+          <div className="anim-up">
+            <h1 style={{ fontFamily: "var(--font-display)", fontWeight: 800, fontSize: "clamp(2rem,4vw,3rem)", marginBottom: 24, lineHeight: 1.2, textAlign: "center" }}>{title}</h1>
+            <div style={{ width: 60, height: 4, borderRadius: 2, background: "var(--accent)", margin: "0 auto 40px" }} />
+          </div>
+        )}
+
+        <div style={{ fontSize: "1.125rem", lineHeight: 1.85, color: "var(--text-secondary)" }}>
+          {paragraphs.map((p, i) => (
+            <p key={i} style={{ marginBottom: 20 }}>{p}</p>
+          ))}
+          <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 32, marginTop: 24 }}>
+            <h3 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "1.25rem", marginBottom: 16 }}>Contact</h3>
+            <p style={{ fontSize: 14, color: "var(--text-secondary)" }}>
+              Email: <a href={`mailto:${contactEm}`} style={{ color: "var(--accent)" }}>{contactEm}</a>
+            </p>
+          </div>
+        </div>
+      </div>
+      <div className="container"><NewsletterSection /></div>
+    </div>
+  );
+};
 
 // ─── NEWSLETTER ────────────────────────────────────────────────────────────────
 
@@ -1378,6 +2145,21 @@ const NewsletterSection = ({ variant = "default" }) => {
   if (success) return <div style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: 24, textAlign: "center" }}><p style={{ fontSize: "1.25rem", marginBottom: 8 }}>📬</p><p style={{ fontWeight: 600 }}>Check your inbox!</p><p style={{ fontSize: 14, color: "var(--text-secondary)", marginTop: 4 }}>Click the confirmation link we just sent you.</p></div>;
 
   if (variant === "minimal") return <form onSubmit={handleSubscribe} style={{ display: "flex", gap: 8, maxWidth: 400 }}><input value={email} onChange={e => setEmail(e.target.value)} type="email" placeholder="your@email.com" required style={{ ...inputStyle, flex: 1, borderRadius: "var(--radius-xl)" }} /><button type="submit" style={{ padding: "10px 20px", border: "none", borderRadius: "var(--radius-xl)", background: "var(--accent)", color: "#fff", fontSize: 14, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>Subscribe</button></form>;
+
+  if (variant === "overlay") return (
+    <section style={{ textAlign: "center", color: "#fff", padding: "8px 0" }}>
+      <div style={{ fontSize: 40, marginBottom: 12 }}>📬</div>
+      <h2 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "clamp(1.75rem,3.5vw,2.5rem)", marginBottom: 10, textShadow: "0 2px 12px rgba(0,0,0,0.4)" }}>Stay in the loop</h2>
+      <p style={{ color: "rgba(255,255,255,0.9)", fontSize: 16, maxWidth: 520, margin: "0 auto 28px", lineHeight: 1.6 }}>
+        Get the latest stories delivered straight to your inbox.
+      </p>
+      <form onSubmit={handleSubscribe} style={{ display: "flex", gap: 10, maxWidth: 480, margin: "0 auto", flexWrap: "wrap", justifyContent: "center" }}>
+        <input value={email} onChange={e => setEmail(e.target.value)} type="email" placeholder="Enter your email" required
+          style={{ flex: "1 1 240px", padding: "14px 18px", border: "1px solid rgba(255,255,255,0.3)", borderRadius: "var(--radius-xl)", background: "rgba(255,255,255,0.95)", color: "#1a1a1a", fontSize: 15, outline: "none" }} />
+        <button type="submit" style={{ padding: "14px 32px", border: "none", borderRadius: "var(--radius-xl)", background: "var(--accent)", color: "#fff", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>Subscribe</button>
+      </form>
+    </section>
+  );
 
   return <section style={{ background: "var(--bg-card)", border: "1px solid var(--border)", borderRadius: "var(--radius-lg)", padding: "clamp(32px,5vw,56px)", textAlign: "center", margin: "48px 0" }}><div style={{ fontSize: 36, marginBottom: 12 }}>📬</div><h2 style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: "clamp(1.5rem,3vw,2rem)", marginBottom: 8 }}>Stay in the loop</h2><p style={{ color: "var(--text-secondary)", fontSize: 16, maxWidth: 480, margin: "0 auto 24px", lineHeight: 1.6 }}>Get the latest stories delivered straight to your inbox.</p><form onSubmit={handleSubscribe} style={{ display: "flex", gap: 10, maxWidth: 460, margin: "0 auto", flexWrap: "wrap", justifyContent: "center" }}><input value={email} onChange={e => setEmail(e.target.value)} type="email" placeholder="Enter your email" required style={{ ...inputStyle, flex: "1 1 240px", borderRadius: "var(--radius-xl)" }} /><button type="submit" style={{ padding: "14px 32px", border: "none", borderRadius: "var(--radius-xl)", background: "var(--accent)", color: "#fff", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>Subscribe</button></form></section>;
 };
@@ -1414,14 +2196,26 @@ const LengthBadge = ({ length }) => {
   return <span style={{ padding: "2px 8px", borderRadius: 12, fontSize: 10, fontWeight: 600, background: c.color + "15", color: c.color, marginLeft: 6 }}>{c.text}</span>;
 };
 
+const RECO_DISMISS_KEY = "jd:reco-dismissed";
+const RECO_DISMISS_MS  = 24 * 60 * 60 * 1000; // 24h
+
 const RecommendationWidget = ({ currentArticleId = null }) => {
   const { posts, setPage } = useApp();
-  const [dismissed, setDismissed] = useState(false);
+  const [dismissed, setDismissed] = useState(() => {
+    const stamp = Number(localStorage.getItem(RECO_DISMISS_KEY) || 0);
+    return stamp && (Date.now() - stamp) < RECO_DISMISS_MS;
+  });
   const [show, setShow] = useState(false);
 
   useEffect(() => {
+    if (dismissed) return;
     const timer = setTimeout(() => setShow(true), 20000);
     return () => clearTimeout(timer);
+  }, [dismissed]);
+
+  const handleDismiss = useCallback(() => {
+    localStorage.setItem(RECO_DISMISS_KEY, String(Date.now()));
+    setDismissed(true);
   }, []);
 
   const recommended = useMemo(() => {
@@ -1442,11 +2236,11 @@ const RecommendationWidget = ({ currentArticleId = null }) => {
           <span style={{ fontSize: 16 }}>✨</span>
           <span style={{ fontWeight: 600, fontSize: 14, color: "var(--accent)" }}>Recommended for you</span>
         </div>
-        <button onClick={() => setDismissed(true)} style={{ border: "none", background: "none", cursor: "pointer", color: "var(--text-tertiary)", padding: 2, display: "flex" }}><I n="close" s={16} /></button>
+        <button onClick={handleDismiss} style={{ border: "none", background: "none", cursor: "pointer", color: "var(--text-tertiary)", padding: 2, display: "flex" }}><I n="close" s={16} /></button>
       </div>
       <div style={{ padding: "8px 14px" }}>
         {recommended.map((a, i) => (
-          <div key={a.id} onClick={() => { setPage({ name: "article", id: a.id }); setDismissed(true); }}
+          <div key={a.id} onClick={() => { setPage({ name: "article", id: a.id }); handleDismiss(); }}
             style={{ display: "flex", gap: 12, padding: "10px 4px", cursor: "pointer", borderBottom: i < recommended.length - 1 ? "1px solid var(--border-light)" : "none", transition: "var(--transition)" }}>
             {a.coverImage && <div style={{ width: 56, height: 56, borderRadius: "var(--radius-sm)", flexShrink: 0, background: `url(${a.coverImage}) center/cover` }} />}
             <div>
@@ -1469,12 +2263,16 @@ const ArticleCard = ({ article, variant = "default", index = 0 }) => {
 };
 
 const Header = () => {
-  const { currentUser, setPage, page, theme, toggleTheme, logout, categories } = useApp();
+  const { currentUser, setPage, page, theme, toggleTheme, logout, categories, siteSettings } = useApp();
   const [menuOpen,   setMenuOpen]   = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQ,    setSearchQ]    = useState("");
   const [userMenu,   setUserMenu]   = useState(false);
   const userMenuRef = useRef(null);
+
+  const siteName = siteSettings?.siteName || "The Jaaga Desk";
+  const tagline  = siteSettings?.tagline  || "Stories that illuminate";
+  const logoUrl  = siteSettings?.logoUrl  || "";
 
   // Fix 2: close dropdown when clicking anywhere outside it
   useEffect(() => {
@@ -1498,8 +2296,19 @@ const Header = () => {
     <header style={{ position: "sticky", top: 0, zIndex: 100, height: "var(--header-height)", borderBottom: "1px solid var(--border)", backdropFilter: "blur(20px)", backgroundColor: "color-mix(in srgb, var(--bg-primary) 85%, transparent)" }}>
       <div className="container" style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 12, cursor: "pointer" }} onClick={() => setPage({ name: "home" })}>
-          <div style={{ width: 36, height: 36, borderRadius: "50%", background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontFamily: "var(--font-display)", fontWeight: 800, fontSize: 18 }}>J</div>
-          <div><span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 20, letterSpacing: "-.02em", display: "block", lineHeight: 1.1 }}>The Jaaga Desk</span><span className="hide-m" style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: ".1em" }}>Stories that illuminate</span></div>
+          {logoUrl ? (
+            <div style={{ width: 36, height: 36, borderRadius: "50%", overflow: "hidden", flexShrink: 0 }}>
+              <img src={logoUrl} alt={siteName} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            </div>
+          ) : (
+            <div style={{ width: 36, height: 36, borderRadius: "50%", background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontFamily: "var(--font-display)", fontWeight: 800, fontSize: 18 }}>
+              {siteName.charAt(0).toUpperCase()}
+            </div>
+          )}
+          <div>
+            <span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 20, letterSpacing: "-.02em", display: "block", lineHeight: 1.1 }}>{siteName}</span>
+            <span className="hide-m" style={{ fontSize: 10, color: "var(--text-tertiary)", textTransform: "uppercase", letterSpacing: ".1em" }}>{tagline}</span>
+          </div>
         </div>
         <nav style={{ display: "flex", alignItems: "center", gap: 8 }}>
           {["Home", "Categories", "Trending", "About"].map(item => <button key={item} onClick={() => setPage({ name: item.toLowerCase() })} className="hide-m" style={{ padding: "8px 14px", border: "none", borderRadius: "var(--radius-sm)", background: page.name === item.toLowerCase() ? "var(--accent-light)" : "transparent", color: page.name === item.toLowerCase() ? "var(--accent)" : "var(--text-secondary)", cursor: "pointer", fontSize: 14, fontWeight: 500 }}>{item}</button>)}
@@ -1534,8 +2343,109 @@ const Header = () => {
 };
 
 const Footer = () => {
-  const { setPage, categories } = useApp();
-  return <footer style={{ borderTop: "1px solid var(--border)", background: "var(--bg-secondary)", padding: "48px 0 24px" }}><div className="container"><div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(200px,1fr))", gap: 32, marginBottom: 40 }}><div><div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}><div style={{ width: 32, height: 32, borderRadius: "50%", background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontFamily: "var(--font-display)", fontWeight: 800, fontSize: 16 }}>J</div><span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 18 }}>The Jaaga Desk</span></div><p style={{ fontSize: 14, color: "var(--text-tertiary)", lineHeight: 1.6, maxWidth: 260 }}>Stories that illuminate — rooted in Northern Ghanaian heritage, reaching across the world.</p></div><div><h4 style={{ fontWeight: 700, fontSize: 14, marginBottom: 16, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--text-tertiary)" }}>Quick Links</h4>{["Home", "About", "Trending", "Categories"].map(item => <div key={item} onClick={() => setPage({ name: item.toLowerCase() })} style={{ cursor: "pointer", color: "var(--text-secondary)", fontSize: 14, padding: "6px 0" }}>{item}</div>)}</div><div><h4 style={{ fontWeight: 700, fontSize: 14, marginBottom: 16, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--text-tertiary)" }}>Topics</h4>{categories?.slice(0, 6).map(c => <div key={c.id} onClick={() => setPage({ name: "category", id: c.id })} style={{ cursor: "pointer", color: "var(--text-secondary)", fontSize: 14, padding: "6px 0" }}>{c.icon} {c.name}</div>)}</div><div><h4 style={{ fontWeight: 700, fontSize: 14, marginBottom: 16, textTransform: "uppercase", letterSpacing: ".05em", color: "var(--text-tertiary)" }}>Newsletter</h4><p style={{ fontSize: 14, color: "var(--text-secondary)", marginBottom: 12, lineHeight: 1.5 }}>Weekly updates delivered to your inbox.</p><NewsletterSection variant="minimal" /></div></div><div style={{ borderTop: "1px solid var(--border)", paddingTop: 20, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, fontSize: 13, color: "var(--text-tertiary)" }}><span>© 2026 The Jaaga Desk. All rights reserved.</span><div style={{ display: "flex", gap: 20 }}><a href="https://www.freeprivacypolicy.com/" target="_blank" rel="noopener noreferrer" style={{ color: "var(--text-tertiary)" }}>Privacy Policy</a><span onClick={() => setPage({ name: "about" })} style={{ cursor: "pointer" }}>Contact</span></div></div></div></footer>;
+  const { setPage, categories, siteSettings } = useApp();
+  const siteName  = siteSettings?.siteName || "The Jaaga Desk";
+  const logoUrl   = siteSettings?.logoUrl  || "";
+  const blurb     = siteSettings?.footer?.blurb || "";
+  const copyright = siteSettings?.footer?.copyright || `© ${new Date().getFullYear()} ${siteName}. All rights reserved.`;
+  const social    = siteSettings?.social || {};
+  const footerBg  = siteSettings?.sections?.footer || {};
+
+  const socialLinks = [
+    { key: "twitter",   label: "Twitter",   url: social.twitter,   icon: "🐦" },
+    { key: "instagram", label: "Instagram", url: social.instagram, icon: "📷" },
+    { key: "facebook",  label: "Facebook",  url: social.facebook,  icon: "👍" },
+    { key: "youtube",   label: "YouTube",   url: social.youtube,   icon: "▶" },
+    { key: "linkedin",  label: "LinkedIn",  url: social.linkedin,  icon: "💼" },
+    { key: "tiktok",    label: "TikTok",    url: social.tiktok,    icon: "🎵" },
+  ].filter(s => s.url);
+
+  return (
+    <SectionMedia
+      url={footerBg.backgroundUrl}
+      type={footerBg.backgroundType}
+      overlay="rgba(0,0,0,0.78)"
+    >
+      <footer style={{
+        borderTop: footerBg.backgroundUrl ? "none" : "1px solid var(--border)",
+        background: footerBg.backgroundUrl ? "transparent" : "var(--bg-secondary)",
+        color: footerBg.backgroundUrl ? "#fff" : "inherit",
+        padding: "56px 0 24px",
+      }}>
+        <div className="container">
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(220px,1fr))", gap: 32, marginBottom: 40 }}>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
+                {logoUrl ? (
+                  <div style={{ width: 32, height: 32, borderRadius: "50%", overflow: "hidden" }}>
+                    <img src={logoUrl} alt={siteName} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  </div>
+                ) : (
+                  <div style={{ width: 32, height: 32, borderRadius: "50%", background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontFamily: "var(--font-display)", fontWeight: 800, fontSize: 16 }}>
+                    {siteName.charAt(0).toUpperCase()}
+                  </div>
+                )}
+                <span style={{ fontFamily: "var(--font-display)", fontWeight: 700, fontSize: 18 }}>{siteName}</span>
+              </div>
+              <p style={{ fontSize: 14, color: footerBg.backgroundUrl ? "rgba(255,255,255,0.7)" : "var(--text-tertiary)", lineHeight: 1.6, maxWidth: 260, marginBottom: socialLinks.length ? 16 : 0 }}>{blurb}</p>
+              {socialLinks.length > 0 && (
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  {socialLinks.map(s => (
+                    <a key={s.key} href={s.url} target="_blank" rel="noopener noreferrer" aria-label={s.label}
+                      style={{
+                        width: 36, height: 36, display: "flex", alignItems: "center", justifyContent: "center",
+                        borderRadius: "50%",
+                        background: footerBg.backgroundUrl ? "rgba(255,255,255,0.12)" : "var(--bg-card)",
+                        border: footerBg.backgroundUrl ? "1px solid rgba(255,255,255,0.2)" : "1px solid var(--border)",
+                        color: footerBg.backgroundUrl ? "#fff" : "var(--text-secondary)",
+                        fontSize: 16, textDecoration: "none",
+                      }}>{s.icon}</a>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div>
+              <h4 style={{ fontWeight: 700, fontSize: 14, marginBottom: 16, textTransform: "uppercase", letterSpacing: ".05em", color: footerBg.backgroundUrl ? "rgba(255,255,255,0.7)" : "var(--text-tertiary)" }}>Quick Links</h4>
+              {["Home", "About", "Trending", "Categories"].map(item => (
+                <div key={item} onClick={() => setPage({ name: item.toLowerCase() })}
+                  style={{ cursor: "pointer", color: footerBg.backgroundUrl ? "rgba(255,255,255,0.85)" : "var(--text-secondary)", fontSize: 14, padding: "6px 0" }}>
+                  {item}
+                </div>
+              ))}
+            </div>
+            <div>
+              <h4 style={{ fontWeight: 700, fontSize: 14, marginBottom: 16, textTransform: "uppercase", letterSpacing: ".05em", color: footerBg.backgroundUrl ? "rgba(255,255,255,0.7)" : "var(--text-tertiary)" }}>Topics</h4>
+              {categories?.slice(0, 6).map(c => (
+                <div key={c.id} onClick={() => setPage({ name: "category", id: c.id })}
+                  style={{ cursor: "pointer", color: footerBg.backgroundUrl ? "rgba(255,255,255,0.85)" : "var(--text-secondary)", fontSize: 14, padding: "6px 0" }}>
+                  {c.icon} {c.name}
+                </div>
+              ))}
+            </div>
+            <div>
+              <h4 style={{ fontWeight: 700, fontSize: 14, marginBottom: 16, textTransform: "uppercase", letterSpacing: ".05em", color: footerBg.backgroundUrl ? "rgba(255,255,255,0.7)" : "var(--text-tertiary)" }}>Newsletter</h4>
+              <p style={{ fontSize: 14, color: footerBg.backgroundUrl ? "rgba(255,255,255,0.85)" : "var(--text-secondary)", marginBottom: 12, lineHeight: 1.5 }}>Weekly updates delivered to your inbox.</p>
+              <NewsletterSection variant="minimal" />
+            </div>
+          </div>
+          <div style={{
+            borderTop: footerBg.backgroundUrl ? "1px solid rgba(255,255,255,0.15)" : "1px solid var(--border)",
+            paddingTop: 20,
+            display: "flex", justifyContent: "space-between", alignItems: "center",
+            flexWrap: "wrap", gap: 12, fontSize: 13,
+            color: footerBg.backgroundUrl ? "rgba(255,255,255,0.65)" : "var(--text-tertiary)",
+          }}>
+            <span>{copyright}</span>
+            <div style={{ display: "flex", gap: 20 }}>
+              <a href="https://www.freeprivacypolicy.com/" target="_blank" rel="noopener noreferrer"
+                style={{ color: "inherit" }}>Privacy Policy</a>
+              <span onClick={() => setPage({ name: "about" })} style={{ cursor: "pointer" }}>Contact</span>
+            </div>
+          </div>
+        </div>
+      </footer>
+    </SectionMedia>
+  );
 };
 
 const BackToTop = () => {

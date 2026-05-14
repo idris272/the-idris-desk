@@ -32,3 +32,6 @@ ui-debug.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code workspace (worktrees + session state)
+.claude/
